@@ -1,0 +1,590 @@
+<mujoco model="pipeline_scene">
+
+    <compiler angle="radian" autolimits="true" />
+    <option timestep="0.002" integrator="implicitfast" solver="PGS" gravity="0 0 -9.82"
+            cone="elliptic">
+    </option>
+
+    <include file="../universal_robots_ur5e/ur5e_mobile.xml" />
+
+    <statistic center="1.5 1.0 0.8" extent="5.0" meansize="0.08" />
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+        <rgba haze="0.15 0.25 0.35 1" />
+        <global azimuth="150" elevation="-25" offwidth="1280" offheight="720" />
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.35 0.55 0.75" rgb2="0.08 0.08 0.12"
+                 width="512" height="3072" />
+        <texture type="2d" name="ground_tex" builtin="checker"
+                 rgb1="0.56 0.55 0.53" rgb2="0.52 0.51 0.49" markrgb="0.54 0.53 0.51"
+                 width="300" height="300" />
+        <material name="groundplane" texture="ground_tex" texuniform="true" texrepeat="12 12"
+                  reflectance="0.05" />
+
+        <material name="pipe_steel"     rgba="0.52 0.53 0.55 1" specular="0.6" shininess="0.3"/>
+        <material name="pipe_rust"      rgba="0.45 0.38 0.32 1" specular="0.3" shininess="0.15"/>
+        <material name="valve_red"      rgba="0.75 0.15 0.10 1" specular="0.4" shininess="0.2"/>
+        <material name="valve_blue"     rgba="0.15 0.35 0.65 1" specular="0.4" shininess="0.2"/>
+        <material name="flange_metal"   rgba="0.50 0.52 0.55 1" specular="0.5" shininess="0.25"/>
+        <material name="support_gray"   rgba="0.35 0.36 0.38 1" specular="0.2"/>
+        <material name="fence_green"    rgba="0.20 0.40 0.20 1" specular="0.15"/>
+        <material name="cabinet_gray"   rgba="0.40 0.45 0.40 1" specular="0.2"/>
+        <material name="building_blue"  rgba="0.45 0.55 0.65 1" specular="0.15"/>
+        <material name="warning_yellow" rgba="0.90 0.80 0.10 1" specular="0.3"/>
+        <material name="marker_orange"  rgba="0.90 0.50 0.10 1" specular="0.2"/>
+        <material name="concrete"       rgba="0.55 0.54 0.52 1" specular="0.05"/>
+        <material name="walkway_gray"   rgba="0.60 0.59 0.57 1" specular="0.08"/>
+        <material name="door_brown"     rgba="0.45 0.35 0.25 1" specular="0.1"/>
+        <material name="roof_gray"      rgba="0.42 0.43 0.45 1" specular="0.15"/>
+        <material name="lamp_white"     rgba="0.95 0.95 0.90 1" specular="0.5" shininess="0.5"/>
+        <material name="gauge_white"    rgba="0.92 0.92 0.90 1" specular="0.3"/>
+        <material name="sign_black"     rgba="0.12 0.12 0.12 1"/>
+    </asset>
+
+    <worldbody>
+
+        <!-- ==================== 照明 ==================== -->
+        <light pos="1 0 4" dir="0 0 -1" directional="true"
+               diffuse="0.7 0.7 0.7" specular="0.3 0.3 0.3"/>
+        <light pos="3 -1 3" dir="0 0.3 -1" directional="false"
+               diffuse="0.4 0.4 0.4" specular="0.15 0.15 0.15"/>
+        <light pos="-1 2 3" dir="0.2 -0.2 -1" directional="false"
+               diffuse="0.3 0.3 0.3" specular="0.1 0.1 0.1"/>
+
+        <!-- ==================== 地面 ==================== -->
+        <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" />
+
+        <!-- ==================== 坐标轴 (调试) ==================== -->
+        <geom name="x-axis" group="2" type="cylinder" contype="0" conaffinity="0"
+              fromto="0 0 0 1 0 0" size="0.008" rgba="1 0 0 1" />
+        <geom name="y-axis" group="2" type="cylinder" contype="0" conaffinity="0"
+              fromto="0 0 0 0 1 0" size="0.008" rgba="0 1 0 1" />
+        <geom name="z-axis" group="2" type="cylinder" contype="0" conaffinity="0"
+              fromto="0 0 0 0 0 1" size="0.008" rgba="0 0 1 1" />
+
+        <!-- ==================== 摄像机 ==================== -->
+        <camera name="cam_overview" pos="1.0 -2.5 3.5" xyaxes="1 0 0 0 0.45 1" mode="fixed" />
+        <camera name="cam_side"     pos="3.5 0.3 1.5" xyaxes="0 1 0 -0.3 0 1" mode="fixed" />
+        <camera name="cam_valve"    pos="0.8 -0.5 1.2" xyaxes="1 0 0 0 0.4 1" mode="fixed" />
+        <camera name="cam_bird"     pos="2.0 1.0 7.0" xyaxes="1 0 0 0 1 0" mode="fixed" />
+        <body name="task_markers" pos="0 0 0">
+            <site name="cart_nav_target_1" pos="0.0 0.0 0.0" size="0.01"
+                  rgba="0.1 0.8 0.1 0.25"/>
+            <site name="cart_nav_target_2" pos="3.5 0.0 0.0" size="0.01"
+                  rgba="0.1 0.8 0.1 0.25"/>
+        </body>
+
+        <!-- ============================================================ -->
+        <!--                       主干管网                                -->
+        <!-- ============================================================ -->
+
+        <!-- 管道 A: 主进站管线, y=0.4, z=0.5 -->
+        <geom name="pipe_A" type="capsule" material="pipe_steel"
+              fromto="-3.0 0.4 0.5  6.0 0.4 0.5" size="0.065"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- 管道 B: 平行回路管线, y=2.0, z=0.5 -->
+        <geom name="pipe_B" type="capsule" material="pipe_steel"
+              fromto="-0.5 2.0 0.5  6.0 2.0 0.5" size="0.065"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- 连通管 1: x=2.5, 连接 A-B -->
+        <geom name="cross_pipe_1" type="capsule" material="pipe_steel"
+              fromto="2.5 0.4 0.5  2.5 2.0 0.5" size="0.05"
+              contype="0" conaffinity="0" group="2"/>
+        <!-- 连通管 2: x=5.0, 连接 A-B -->
+        <geom name="cross_pipe_2" type="capsule" material="pipe_steel"
+              fromto="5.0 0.4 0.5  5.0 2.0 0.5" size="0.05"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- 管道 A 微锈旧管段装饰 (局部覆盖) -->
+
+
+
+
+
+
+        <!-- 管道 B 到管道 A 的弯管连接段 (左端) -->
+        <geom name="pipe_B_elbow" type="capsule" material="pipe_steel"
+              fromto="-0.5 2.0 0.5  -0.5 0.4 0.5" size="0.05"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- ============================================================ -->
+        <!--                         法兰                                  -->
+        <!-- ============================================================ -->
+
+        <!-- 管道 A 端部法兰 -->
+        <geom name="flange_A_left" type="cylinder" material="flange_metal"
+              size="0.085 0.015" pos="-3.0 0.4 0.5" euler="0 1.5708 0"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_A_right" type="cylinder" material="flange_metal"
+              size="0.085 0.015" pos="6.0 0.4 0.5" euler="0 1.5708 0"
+              contype="0" conaffinity="0" group="2"/>
+        <!-- 管道 B 端部法兰 -->
+        <geom name="flange_B_left" type="cylinder" material="flange_metal"
+              size="0.085 0.015" pos="-0.5 2.0 0.5" euler="0 1.5708 0"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_B_right" type="cylinder" material="flange_metal"
+              size="0.085 0.015" pos="6.0 2.0 0.5" euler="0 1.5708 0"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- 管道 A 内联法兰 -->
+        <geom name="flange_A_i1" type="cylinder" material="flange_metal"
+              size="0.08 0.012" pos="-1.5 0.4 0.5" euler="0 1.5708 0"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_A_i2" type="cylinder" material="flange_metal"
+              size="0.08 0.012" pos="0.0 0.4 0.5" euler="0 1.5708 0"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_A_i3" type="cylinder" material="flange_metal"
+              size="0.08 0.012" pos="3.0 0.4 0.5" euler="0 1.5708 0"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_A_i4" type="cylinder" material="flange_metal"
+              size="0.08 0.012" pos="4.5 0.4 0.5" euler="0 1.5708 0"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- 连通管三通法兰 -->
+        <geom name="flange_junc_1A" type="cylinder" material="flange_metal"
+              size="0.07 0.012" pos="2.5 0.4 0.5" euler="1.5708 0 0"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_junc_1B" type="cylinder" material="flange_metal"
+              size="0.07 0.012" pos="2.5 2.0 0.5" euler="1.5708 0 0"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_junc_2A" type="cylinder" material="flange_metal"
+              size="0.07 0.012" pos="5.0 0.4 0.5" euler="1.5708 0 0"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_junc_2B" type="cylinder" material="flange_metal"
+              size="0.07 0.012" pos="5.0 2.0 0.5" euler="1.5708 0 0"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- 阀门法兰 -->
+        <geom name="flange_valve_1" type="cylinder" material="flange_metal"
+              size="0.06 0.012" pos="0.45 0.4 0.53"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="flange_valve_2" type="cylinder" material="flange_metal"
+              size="0.06 0.012" pos="1.2 0.4 0.53"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- ============================================================ -->
+        <!--                     管道支架 (门型)                            -->
+        <!-- ============================================================ -->
+
+        <!-- 管道 A 支架 -->
+        <body name="support_A1" pos="-2.0 0.4 0">
+            <geom name="sA1_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA1_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA1_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+        <body name="support_A2" pos="-0.5 0.4 0">
+            <geom name="sA2_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA2_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA2_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+        <body name="support_A3" pos="2.5 0.4 0">
+            <geom name="sA3_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA3_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA3_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+        <body name="support_A4" pos="4.0 0.4 0">
+            <geom name="sA4_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA4_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA4_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+        <body name="support_A5" pos="5.5 0.4 0">
+            <geom name="sA5_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA5_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sA5_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+
+        <!-- 管道 B 支架 -->
+        <body name="support_B1" pos="1.0 2.0 0">
+            <geom name="sB1_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sB1_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sB1_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+        <body name="support_B2" pos="2.5 2.0 0">
+            <geom name="sB2_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sB2_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sB2_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+        <body name="support_B3" pos="4.0 2.0 0">
+            <geom name="sB3_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sB3_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sB3_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+        <body name="support_B4" pos="5.5 2.0 0">
+            <geom name="sB4_ll" type="box" size="0.025 0.025 0.24" pos="0 -0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sB4_lr" type="box" size="0.025 0.025 0.24" pos="0 0.1 0.24"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="sB4_bm" type="box" size="0.035 0.13 0.015" pos="0 0 0.46"
+                  material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+
+        <!-- ============================================================ -->
+        <!--                  阀门 1 - 左臂操作 (可旋转)                    -->
+        <!-- ============================================================ -->
+
+        <body name="valve_body_1" pos="0.45 0.4 0.55">
+            <geom name="valve_housing" type="box" size="0.04 0.04 0.035"
+                  rgba="0.4 0.42 0.45 1" contype="0" conaffinity="0"/>
+            <body name="valve_stem_assembly" pos="0 0 0.035">
+                <joint name="valve_joint" type="hinge" axis="0 0 1"
+                       damping="1.5" armature="0.05" range="-6.28 6.28"/>
+                <inertial mass="0.3" pos="0 0 0.05" diaginertia="0.0005 0.0005 0.0003"/>
+                <geom name="valve_stem_geom" type="cylinder" size="0.008 0.06"
+                      rgba="0.55 0.55 0.58 1"/>
+                <body name="valve_handwheel" pos="0 0 0.065">
+                    <geom name="hw_hub" type="cylinder" size="0.012 0.008"
+                          material="valve_red"/>
+                    <geom name="hw_spoke_x" type="box" size="0.035 0.005 0.005"
+                          material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_spoke_y" type="box" size="0.005 0.035 0.005"
+                          material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_ring_px" type="box" size="0.005 0.018 0.005"
+                          pos="0.032 0 0" material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_ring_nx" type="box" size="0.005 0.018 0.005"
+                          pos="-0.032 0 0" material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_ring_py" type="box" size="0.018 0.005 0.005"
+                          pos="0 0.032 0" material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_ring_ny" type="box" size="0.018 0.005 0.005"
+                          pos="0 -0.032 0" material="valve_red" friction="1.5 0.5 0.5"/>
+                    <site name="handwheel_center" type="sphere" size="0.008"
+                          pos="0 0 0.008" rgba="1 1 0 0.6"/>
+                </body>
+            </body>
+        </body>
+
+        <!-- ============================================================ -->
+        <!--                  阀门 2 - 右臂操作 (可旋转)                    -->
+        <!-- ============================================================ -->
+
+        <body name="valve_body_2" pos="3.5 0.4 0.55">
+            <geom name="valve_housing_2" type="box" size="0.04 0.04 0.035"
+                  rgba="0.4 0.42 0.45 1" contype="0" conaffinity="0"/>
+            <body name="valve_stem_assembly_2" pos="0 0 0.035">
+                <joint name="valve_joint_2" type="hinge" axis="0 0 1"
+                       damping="1.5" armature="0.05" range="-6.28 6.28"/>
+                <inertial mass="0.3" pos="0 0 0.05" diaginertia="0.0005 0.0005 0.0003"/>
+                <geom name="valve_stem_geom_2" type="cylinder" size="0.008 0.06"
+                      rgba="0.55 0.55 0.58 1"/>
+                <body name="valve_handwheel_2" pos="0 0 0.065">
+                    <geom name="hw_hub_2" type="cylinder" size="0.012 0.008"
+                          material="valve_red"/>
+                    <geom name="hw_spoke_x_2" type="box" size="0.035 0.005 0.005"
+                          material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_spoke_y_2" type="box" size="0.005 0.035 0.005"
+                          material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_ring_px_2" type="box" size="0.005 0.018 0.005"
+                          pos="0.032 0 0" material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_ring_nx_2" type="box" size="0.005 0.018 0.005"
+                          pos="-0.032 0 0" material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_ring_py_2" type="box" size="0.018 0.005 0.005"
+                          pos="0 0.032 0" material="valve_red" friction="1.5 0.5 0.5"/>
+                    <geom name="hw_ring_ny_2" type="box" size="0.018 0.005 0.005"
+                          pos="0 -0.032 0" material="valve_red" friction="1.5 0.5 0.5"/>
+                    <site name="handwheel_center_2" type="sphere" size="0.008"
+                          pos="0 0 0.008" rgba="0 1 1 0.6"/>
+                </body>
+            </body>
+        </body>
+
+        <!-- ============================================================ -->
+        <!--                  装饰阀门 (纯视觉)                            -->
+        <!-- ============================================================ -->
+
+
+
+
+
+
+
+        <!-- ============================================================ -->
+        <!--                      仪表设备                                 -->
+        <!-- ============================================================ -->
+
+        <!-- 压力表 1 -->
+        <body name="pressure_gauge_1" pos="0.2 0.4 0">
+            <geom name="pg1_stub" type="cylinder" size="0.01 0.1"
+                  pos="0 0 0.6" material="pipe_steel" contype="0" conaffinity="0" group="2"/>
+            <geom name="pg1_dial" type="cylinder" size="0.032 0.006"
+                  pos="0 0 0.71" material="gauge_white" contype="0" conaffinity="0" group="2"/>
+            <geom name="pg1_rim" type="cylinder" size="0.035 0.003"
+                  pos="0 0 0.71" material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+
+        <!-- 压力表 2 -->
+        <body name="pressure_gauge_2" pos="1.8 0.4 0">
+            <geom name="pg2_stub" type="cylinder" size="0.01 0.1"
+                  pos="0 0 0.6" material="pipe_steel" contype="0" conaffinity="0" group="2"/>
+            <geom name="pg2_dial" type="cylinder" size="0.032 0.006"
+                  pos="0 0 0.71" material="gauge_white" contype="0" conaffinity="0" group="2"/>
+            <geom name="pg2_rim" type="cylinder" size="0.035 0.003"
+                  pos="0 0 0.71" material="support_gray" contype="0" conaffinity="0" group="2"/>
+        </body>
+
+
+
+
+        <!-- ============================================================ -->
+        <!--                    清管器接收筒                                -->
+        <!-- ============================================================ -->
+
+        <body name="pig_receiver" pos="-2.2 0.4 0">
+            <!-- 水平筒体 -->
+            <geom name="pig_barrel" type="cylinder" size="0.15 0.4"
+                  pos="0 0 0.5" euler="0 1.5708 0"
+                  material="pipe_steel" contype="0" conaffinity="0" group="2"/>
+            <!-- 前端封头 -->
+            <geom name="pig_endcap" type="sphere" size="0.14"
+                  pos="-0.4 0 0.5"
+                  material="flange_metal" contype="0" conaffinity="0" group="2"/>
+            <!-- 后端法兰 -->
+            <geom name="pig_flange" type="cylinder" size="0.18 0.02"
+                  pos="0.4 0 0.5" euler="0 1.5708 0"
+                  material="flange_metal" contype="0" conaffinity="0" group="2"/>
+            <!-- 支撑腿 -->
+            <geom name="pig_leg_l" type="box" size="0.06 0.04 0.175"
+                  pos="-0.2 0 0.175" material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="pig_leg_r" type="box" size="0.06 0.04 0.175"
+                  pos="0.2 0 0.175" material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <!-- 排放管 -->
+            <geom name="pig_drain" type="capsule" size="0.015"
+                  fromto="-0.15 0 0.35  -0.15 0 0.15"
+                  material="pipe_steel" contype="0" conaffinity="0" group="2"/>
+        </body>
+
+        <!-- ============================================================ -->
+        <!--                    泵房 / 设备间                               -->
+        <!-- ============================================================ -->
+
+        <body name="pump_room" pos="5.5 1.5 0">
+            <geom name="room_walls" type="box" size="0.6 0.5 0.75"
+                  pos="0 0 0.75" material="building_blue" contype="0" conaffinity="0" group="2"/>
+            <geom name="room_roof" type="box" size="0.65 0.55 0.03"
+                  pos="0 0 1.53" material="roof_gray" contype="0" conaffinity="0" group="2"/>
+            <geom name="room_door" type="box" size="0.005 0.22 0.45"
+                  pos="-0.605 0 0.45" material="door_brown" contype="0" conaffinity="0" group="2"/>
+            <geom name="room_window" type="box" size="0.005 0.18 0.12"
+                  pos="-0.605 -0.3 1.0" rgba="0.6 0.7 0.8 0.5" contype="0" conaffinity="0" group="2"/>
+            <!-- 安全标语牌 -->
+            <geom name="room_safety_sign" type="box" size="0.005 0.25 0.1"
+                  pos="-0.605 0.2 1.2" material="warning_yellow" contype="0" conaffinity="0" group="2"/>
+        </body>
+
+        <!-- ============================================================ -->
+        <!--                      电气柜                                   -->
+        <!-- ============================================================ -->
+
+        <body name="elec_cabinets" pos="5.5 -0.5 0">
+            <!-- 防潮底座 -->
+            <geom name="cab_base" type="box" size="0.55 0.12 0.05"
+                  pos="0 0 0.05" material="support_gray" contype="0" conaffinity="0" group="2"/>
+            <!-- 柜体 1 -->
+            <geom name="cab_1" type="box" size="0.15 0.1 0.4"
+                  pos="-0.3 0 0.5" material="cabinet_gray" contype="0" conaffinity="0" group="2"/>
+            <!-- 柜体 2 -->
+            <geom name="cab_2" type="box" size="0.15 0.1 0.4"
+                  pos="0.0 0 0.5" material="cabinet_gray" contype="0" conaffinity="0" group="2"/>
+            <!-- 柜体 3 -->
+            <geom name="cab_3" type="box" size="0.15 0.1 0.4"
+                  pos="0.3 0 0.5" material="cabinet_gray" contype="0" conaffinity="0" group="2"/>
+            <!-- 柜门把手 (装饰) -->
+            <geom name="cab_handle_1" type="box" size="0.008 0.015 0.04"
+                  pos="-0.3 -0.115 0.55" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0" group="2"/>
+            <geom name="cab_handle_2" type="box" size="0.008 0.015 0.04"
+                  pos="0.0 -0.115 0.55" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0" group="2"/>
+            <geom name="cab_handle_3" type="box" size="0.008 0.015 0.04"
+                  pos="0.3 -0.115 0.55" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0" group="2"/>
+        </body>
+
+
+
+        <!-- ============================================================ -->
+        <!--                    围栏与围栏门                                -->
+        <!-- ============================================================ -->
+
+        <!-- 围栏立柱 (r=0.02, h=1.2m) -->
+        <!-- 底边 y=-1.0 -->
+        <geom name="fp_b1" type="cylinder" size="0.02 0.6" pos="-3.5 -1.0 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_b2" type="cylinder" size="0.02 0.6" pos="-1.0 -1.0 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_b3" type="cylinder" size="0.02 0.6" pos="1.5 -1.0 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_b4" type="cylinder" size="0.02 0.6" pos="4.0 -1.0 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_b5" type="cylinder" size="0.02 0.6" pos="6.5 -1.0 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <!-- 顶边 y=3.5 -->
+        <geom name="fp_t1" type="cylinder" size="0.02 0.6" pos="-3.5 3.5 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_t2" type="cylinder" size="0.02 0.6" pos="-1.0 3.5 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_t3" type="cylinder" size="0.02 0.6" pos="1.5 3.5 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_t4" type="cylinder" size="0.02 0.6" pos="4.0 3.5 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_t5" type="cylinder" size="0.02 0.6" pos="6.5 3.5 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <!-- 左边 x=-3.5 (含门柱) -->
+        <geom name="fp_l_gate_lo" type="cylinder" size="0.02 0.6" pos="-3.5 -0.3 0.6"
+              material="marker_orange" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_l_gate_hi" type="cylinder" size="0.02 0.6" pos="-3.5 0.3 0.6"
+              material="marker_orange" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_l_mid" type="cylinder" size="0.02 0.6" pos="-3.5 1.8 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <!-- 右边 x=6.5 -->
+        <geom name="fp_r_mid1" type="cylinder" size="0.02 0.6" pos="6.5 1.0 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fp_r_mid2" type="cylinder" size="0.02 0.6" pos="6.5 2.5 0.6"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+
+        <!-- 围栏横杆 (2层: z=0.4, z=0.9) -->
+        <!-- 底边 -->
+        <geom name="fr_b_lo" type="capsule" size="0.012"
+              fromto="-3.5 -1.0 0.4  6.5 -1.0 0.4"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fr_b_hi" type="capsule" size="0.012"
+              fromto="-3.5 -1.0 0.9  6.5 -1.0 0.9"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <!-- 顶边 -->
+        <geom name="fr_t_lo" type="capsule" size="0.012"
+              fromto="-3.5 3.5 0.4  6.5 3.5 0.4"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fr_t_hi" type="capsule" size="0.012"
+              fromto="-3.5 3.5 0.9  6.5 3.5 0.9"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <!-- 左边 (门以下) -->
+        <geom name="fr_l1_lo" type="capsule" size="0.012"
+              fromto="-3.5 -1.0 0.4  -3.5 -0.3 0.4"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fr_l1_hi" type="capsule" size="0.012"
+              fromto="-3.5 -1.0 0.9  -3.5 -0.3 0.9"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <!-- 左边 (门以上) -->
+        <geom name="fr_l2_lo" type="capsule" size="0.012"
+              fromto="-3.5 0.3 0.4  -3.5 3.5 0.4"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fr_l2_hi" type="capsule" size="0.012"
+              fromto="-3.5 0.3 0.9  -3.5 3.5 0.9"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <!-- 右边 -->
+        <geom name="fr_r_lo" type="capsule" size="0.012"
+              fromto="6.5 -1.0 0.4  6.5 3.5 0.4"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <geom name="fr_r_hi" type="capsule" size="0.012"
+              fromto="6.5 -1.0 0.9  6.5 3.5 0.9"
+              material="fence_green" contype="0" conaffinity="0" group="2"/>
+        <!-- 门框横梁 -->
+        <geom name="gate_crossbar" type="capsule" size="0.015"
+              fromto="-3.5 -0.3 1.2  -3.5 0.3 1.2"
+              material="marker_orange" contype="0" conaffinity="0" group="2"/>
+
+        <!-- ============================================================ -->
+        <!--                   警示牌与标志桩                               -->
+        <!-- ============================================================ -->
+
+
+
+
+
+
+        <!-- ============================================================ -->
+        <!--                     巡检通道                                  -->
+        <!-- ============================================================ -->
+
+        <!-- 通道路面 -->
+        <geom name="walkway_surface" type="box" size="5.0 0.4 0.015"
+              pos="1.5 -0.3 0.015" material="walkway_gray"
+              contype="0" conaffinity="0" group="2"/>
+
+
+
+        <!-- ============================================================ -->
+        <!--                   附加装饰设施                                 -->
+        <!-- ============================================================ -->
+
+        <!-- 消防箱 (泵房旁) -->
+        <geom name="fire_box" type="box" size="0.15 0.08 0.2"
+              pos="4.6 1.2 0.2" rgba="0.8 0.15 0.1 1"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="fire_box_cross1" type="box" size="0.1 0.003 0.005"
+              pos="4.6 1.12 0.25" rgba="1 1 1 1"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="fire_box_cross2" type="box" size="0.003 0.003 0.1"
+              pos="4.6 1.12 0.2" rgba="1 1 1 1"
+              contype="0" conaffinity="0" group="2"/>
+
+        <!-- 油桶 (站场角落) -->
+        <geom name="barrel_1" type="cylinder" size="0.12 0.22"
+              pos="4.8 -0.7 0.22" rgba="0.2 0.35 0.55 1"
+              contype="0" conaffinity="0" group="2"/>
+        <geom name="barrel_2" type="cylinder" size="0.12 0.22"
+              pos="5.1 -0.7 0.22" rgba="0.5 0.45 0.15 1"
+              contype="0" conaffinity="0" group="2"/>
+
+
+
+
+
+
+
+    </worldbody>
+
+    <!-- ============================================================ -->
+    <!--                         传感器                                -->
+    <!-- ============================================================ -->
+
+    <sensor>
+        <!-- 左臂关节: sensordata[0:6] -->
+        <jointpos joint="shoulder_pan_joint" name="joint1_pos_L"/>
+        <jointpos joint="shoulder_lift_joint" name="joint2_pos_L"/>
+        <jointpos joint="elbow_joint" name="joint3_pos_L"/>
+        <jointpos joint="wrist_1_joint" name="joint4_pos_L"/>
+        <jointpos joint="wrist_2_joint" name="joint5_pos_L"/>
+        <jointpos joint="wrist_3_joint" name="joint6_pos_L"/>
+        <!-- 右臂关节: sensordata[6:12] -->
+        <jointpos joint="shoulder_pan_joint_R" name="joint1_pos_R"/>
+        <jointpos joint="shoulder_lift_joint_R" name="joint2_pos_R"/>
+        <jointpos joint="elbow_joint_R" name="joint3_pos_R"/>
+        <jointpos joint="wrist_1_joint_R" name="joint4_pos_R"/>
+        <jointpos joint="wrist_2_joint_R" name="joint5_pos_R"/>
+        <jointpos joint="wrist_3_joint_R" name="joint6_pos_R"/>
+        <!-- 小车关节: sensordata[12:15] -->
+        <jointpos joint="cart_x" name="cart_x_pos"/>
+        <jointpos joint="cart_y" name="cart_y_pos"/>
+        <jointpos joint="cart_yaw" name="cart_yaw_pos"/>
+        <!-- 阀门1转角: sensordata[15] -->
+        <jointpos joint="valve_joint" name="valve_angle_1"/>
+        <!-- 阀门2转角: sensordata[16] -->
+        <jointpos joint="valve_joint_2" name="valve_angle_2"/>
+    </sensor>
+
+</mujoco>

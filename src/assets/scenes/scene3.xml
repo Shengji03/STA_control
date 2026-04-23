@@ -1,0 +1,184 @@
+<mujoco model="scene">
+
+    <compiler angle="radian" autolimits="true" />
+    <option timestep="0.002" integrator="implicitfast" solver="PGS" gravity="0 0 -9.82"
+            cone="elliptic">
+		<!--		 <flag multiccd="enable"/>-->
+    </option>
+
+    <include file="../universal_robots_ur5e/ur5e.xml" />
+
+
+    <statistic center="1.1 0.6 0.9" extent="1.5" meansize="0.08" />
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+        <rgba haze="0.15 0.25 0.35 1" />
+        <global azimuth="120" elevation="-30" offwidth="1280" offheight="720" />
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512"
+                 height="3072" />
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+                 rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5"
+                  reflectance="0.2" />
+
+        <!--meshes-->
+        <mesh name ="table" file="../table/sigmund_table.stl" scale= "1 1 1"/>
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 1.5" dir="0 0 -1" directional="true" />
+               
+		<geom name="floor" size="0 0 0.05" type="plane" material="groundplane" />
+		<geom name="x-aixs" group="2" type="cylinder" contype="0" conaffinity="0"
+			fromto="0 0 0 1 0 0" size="0.01" rgba="1 0 0 1" />
+		<geom name="y-aixs" group="2" type="cylinder" contype="0" conaffinity="0"
+			fromto="0 0 0 0 1 0" size="0.01" rgba="0 1 0 1" />
+		<geom name="z-aixs" group="2" type="cylinder" contype="0" conaffinity="0"
+			fromto="0 0 0 0 0 1" size="0.01" rgba="0 0 1 1" />
+
+		<!-- 主摄像机 - 俯视全景 -->
+		<camera name="cam_overview" pos="0.8 -0.5 2.0" xyaxes="1 0 0 0 0.5 1" mode="fixed" />
+		<!-- 侧视摄像机 -->
+		<camera name="cam_side" pos="2.0 0.6 1.2" xyaxes="0 1 0 -0.3 0 1" mode="fixed" />
+		<!-- 抓取区域摄像机 -->
+		<camera name="cam_pickup" pos="1.2 0.2 1.3" xyaxes="1 0 0 0 0.5 1" mode="fixed" />
+		<!-- 放置区域摄像机 -->
+		<camera name="cam_drop" pos="0.5 0.2 1.3" xyaxes="1 0 0 0 0.5 1" mode="fixed" />
+
+		<body name="mocap" mocap="true" pos="0.8 0.6 0.74">
+			<geom name="mocap" type="sphere" size="0.000001"/>
+		</body>
+
+		<!-- ==================== 任务物体 ==================== -->
+		
+		<!-- 圆柱形插销 (Pin) - 待抓取物体 -->
+		<!-- 尺寸: 半径0.02m, 高度0.08m (半高0.04m) -->
+		<body name="pin" pos="1.45 0.4 0.79" quat="1 0 0 0">
+			<joint name="pin_joint" type="free" damping="0.01"/>
+			<geom name="pin_geom" type="cylinder" size="0.02 0.04" mass="0.1" rgba="0.9 0.7 0.1 1" 
+			      friction="1 0.5 0.5" condim="6"/>
+			<site name="pin_top" pos="0 0 0.04" size="0.005" rgba="1 0 0 0.8"/>
+		</body>
+		
+		<!-- 凹槽/插孔 (Socket) - 固定在桌面上 -->
+		<!-- 内径比插销略大 (0.022m)，深度0.05m -->
+		<body name="socket" pos="1.45 0.8 0.74" quat="1 0 0 0">
+			<!-- 底座 -->
+			<geom name="socket_base" type="cylinder" size="0.06 0.02" pos="0 0 0.02" rgba="0.4 0.4 0.4 1"/>
+			
+			<!-- 凹槽壁 - 使用4个弧形段近似圆环 -->
+			<geom name="socket_wall_front" type="box" size="0.015 0.035 0.03" pos="0.037 0 0.07" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_wall_back" type="box" size="0.015 0.035 0.03" pos="-0.037 0 0.07" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_wall_left" type="box" size="0.035 0.015 0.03" pos="0 0.037 0.07" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_wall_right" type="box" size="0.035 0.015 0.03" pos="0 -0.037 0.07" rgba="0.5 0.5 0.5 1"/>
+			
+			<!-- 对角壁 -->
+			<geom name="socket_wall_fl" type="box" size="0.012 0.025 0.03" pos="0.026 0.026 0.07" euler="0 0 0.785" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_wall_fr" type="box" size="0.012 0.025 0.03" pos="0.026 -0.026 0.07" euler="0 0 -0.785" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_wall_bl" type="box" size="0.012 0.025 0.03" pos="-0.026 0.026 0.07" euler="0 0 -0.785" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_wall_br" type="box" size="0.012 0.025 0.03" pos="-0.026 -0.026 0.07" euler="0 0 0.785" rgba="0.5 0.5 0.5 1"/>
+			
+			<!-- 凹槽底部 -->
+			<geom name="socket_bottom" type="cylinder" size="0.021 0.002" pos="0 0 0.042" rgba="0.3 0.3 0.3 1"/>
+			
+			<!-- 目标位置标记 (无碰撞) -->
+			<site name="socket_entry" type="sphere" size="0.008" pos="0 0 0.1" rgba="0 1 0 0.6"/>
+			<site name="socket_center" type="cylinder" size="0.019 0.001" pos="0 0 0.05" rgba="0.2 0.8 0.2 0.3"/>
+		</body>
+		
+		<!-- 长方体插销B (Pin B) - 初始已插入凹槽B内, 上半部分露出壁顶, 待拔出 -->
+		<!-- 尺寸: 4cm×4cm×8cm (半尺寸 0.02×0.02×0.04), 与物块相同 -->
+		<body name="pin_b" pos="1.15 0.8 0.85" quat="1 0 0 0">
+			<joint name="pin_b_joint" type="free" damping="0.01"/>
+			<geom name="pin_b_geom" type="box" size="0.02 0.02 0.04" mass="0.1" rgba="0.2 0.6 0.9 1" 
+			      friction="1 0.5 0.5" condim="6"/>
+			<site name="pin_b_top" pos="0 0 0.04" size="0.005" rgba="0.1 0.4 0.8 0.8"/>
+		</body>
+
+		<!-- 长方体凹槽B (Socket B) - 矩形槽, 壁较矮便于拔出 -->
+		<!-- 内部开口 5cm×5cm, 插销B截面 4cm×4cm, 每侧5mm间隙 -->
+		<body name="socket_b" pos="1.15 0.8 0.74" quat="1 0 0 0">
+			<!-- 底座 -->
+			<geom name="socket_b_base" type="box" size="0.045 0.045 0.02" pos="0 0 0.02" rgba="0.4 0.4 0.4 1"/>
+			<!-- 4面矩形壁 -->
+			<geom name="socket_b_wall_front" type="box" size="0.01 0.045 0.02" pos="0.035 0 0.06" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_b_wall_back"  type="box" size="0.01 0.045 0.02" pos="-0.035 0 0.06" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_b_wall_left"  type="box" size="0.045 0.01 0.02" pos="0 0.035 0.06" rgba="0.5 0.5 0.5 1"/>
+			<geom name="socket_b_wall_right" type="box" size="0.045 0.01 0.02" pos="0 -0.035 0.06" rgba="0.5 0.5 0.5 1"/>
+			<!-- 底板 -->
+			<geom name="socket_b_bottom" type="box" size="0.024 0.024 0.002" pos="0 0 0.042" rgba="0.3 0.3 0.3 1"/>
+			<!-- 标记 -->
+			<site name="socket_b_entry" type="sphere" size="0.008" pos="0 0 0.08" rgba="0 0.5 1 0.6"/>
+			<site name="socket_b_center" type="box" size="0.019 0.019 0.001" pos="0 0 0.05" rgba="0.2 0.6 0.8 0.3"/>
+		</body>
+
+		<!-- 可移动物块 (Block) - 待平移物体 -->
+		<!-- 尺寸: 4cm×4cm×8cm (半高0.04m), 底面在桌面上 -->
+		<body name="block" pos="1.30 0.4 0.78" quat="1 0 0 0">
+			<joint name="block_joint" type="free" damping="0.01"/>
+			<geom name="block_geom" type="box" size="0.02 0.02 0.04" mass="0.15" rgba="0.3 0.7 0.9 1"
+			      friction="1 0.5 0.5" condim="6"/>
+			<site name="block_top" pos="0 0 0.04" size="0.005" rgba="0.2 0.6 0.9 0.8"/>
+		</body>
+
+		<!-- ==================== 区域标记 ==================== -->
+		
+		<!-- 抓取区域A - 插销A位置 -->
+		<body name="zone_pickup_a" pos="1.45 0.4 0.74" quat="1 0 0 0">
+			<geom name="zone_pickup_a" type="box" size="0.06 0.06 0.005" rgba="0.2 0.8 0.2 0.2" contype="0" conaffinity="0"/>
+		</body>
+
+		<!-- 插销B放置区域 - 拔出后放回此处 (插销A初始位置) -->
+		<body name="zone_place_b" pos="1.45 0.4 0.74" quat="1 0 0 0">
+			<geom name="zone_place_b" type="box" size="0.06 0.06 0.005" rgba="0.2 0.5 0.8 0.2" contype="0" conaffinity="0"/>
+		</body>
+
+		<!-- 物块区域 -->
+		<body name="zone_block" pos="1.30 0.4 0.74" quat="1 0 0 0">
+			<geom name="zone_block" type="box" size="0.06 0.06 0.005" rgba="0.3 0.7 0.5 0.2" contype="0" conaffinity="0"/>
+		</body>
+
+		<!-- 物块目标区域 -->
+		<body name="zone_block_target" pos="1.30 0.8 0.74" quat="1 0 0 0">
+			<geom name="zone_block_target" type="box" size="0.06 0.06 0.005" rgba="0.7 0.3 0.5 0.2" contype="0" conaffinity="0"/>
+		</body>
+
+		<!-- 放置区域A - 凹槽A位置 -->
+		<body name="zone_drop_a" pos="1.45 0.8 0.74" quat="1 0 0 0">
+			<geom name="zone_drop_a" type="box" size="0.06 0.06 0.005" rgba="0.8 0.2 0.2 0.2" contype="0" conaffinity="0"/>
+		</body>
+
+		<!-- 凹槽B区域 -->
+		<body name="zone_socket_b" pos="1.15 0.8 0.74" quat="1 0 0 0">
+			<geom name="zone_socket_b" type="box" size="0.06 0.06 0.005" rgba="0.5 0.2 0.8 0.2" contype="0" conaffinity="0"/>
+		</body>
+
+        <!--table-->
+		<body name = "table1" euler="0 0 0" pos= "0.8 0 0.74" >
+		  <geom name = "table1" type="mesh" mesh="table" group="2" rgba="0.35 0.35 0.35 1" mass="0" contype="0" conaffinity="0"/>
+		</body>
+		<body name = "table2" euler="0 0 0" pos= "1.6 0 0.74" >
+		  <geom name = "table2" type="mesh" mesh="table" group="2" rgba="0.35 0.35 0.35 1" mass="0" contype="0" conaffinity="0"/>
+		</body>
+
+		<body name="simple_table" pos="0.8 0.6 0.69" quat="1 0 0 0">
+			<geom name="simple_table" type="box" size="0.8 0.6 0.05" rgba="0.5 0.5 0.5 0.1"/>
+		</body>
+    </worldbody>
+
+
+    <!-- 关节位置传感器 -->
+    <sensor>
+        <jointpos joint="shoulder_pan_joint" name="joint1_pos"/>
+        <jointpos joint="shoulder_lift_joint" name="joint2_pos"/>
+        <jointpos joint="elbow_joint" name="joint3_pos"/>
+        <jointpos joint="wrist_1_joint" name="joint4_pos"/>
+        <jointpos joint="wrist_2_joint" name="joint5_pos"/>
+        <jointpos joint="wrist_3_joint" name="joint6_pos"/>
+    </sensor>
+
+</mujoco>
