@@ -72,7 +72,7 @@ def main():
     )
 
     # ========== 轨迹可视化开关 ==========
-    SHOW_TRAJECTORY = False
+    SHOW_TRAJECTORY = True
     # ====================================
 
     runner.run(total_time=args.time, use_viewer=not args.no_viewer,
