@@ -277,9 +277,26 @@ class DialogPlanner:
                           f"{usage.completion_tokens}")
                 return content
             except Exception as e:
+                if self._is_authentication_error(e):
+                    raise RuntimeError(f"LLM authentication failed: {e}") from e
                 print(f"  [LLM] 调用失败 (第 {attempt+1} 次): {e}")
                 time.sleep(1.0)
         return ""
+
+    @staticmethod
+    def _is_authentication_error(error: Exception) -> bool:
+        status_code = getattr(error, "status_code", None)
+        code = getattr(error, "code", None)
+        body = getattr(error, "body", None)
+        text = f"{error} {code} {body}".lower()
+        if status_code == 401:
+            return True
+        return (
+            "invalid_api_key" in text
+            or "incorrect api key" in text
+            or ("api key" in text and ("invalid" in text or "incorrect" in text))
+            or ("401" in text and ("api" in text or "auth" in text))
+        )
 
     # ------------------------------------------------------------------
     # 响应解析

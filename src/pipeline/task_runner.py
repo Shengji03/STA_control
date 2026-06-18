@@ -138,6 +138,10 @@ class TaskRunner:
 
         # Resolve actuator indices
         self._resolve_indices()
+        self._total_time = 300.0
+        self._is_started = False
+        self._reset_runtime_state()
+        self.reset_scene()
 
     def _resolve_indices(self):
         """Find ctrl array indices for arms and cart."""
@@ -605,70 +609,154 @@ class TaskRunner:
         self.data.ctrl[self._cart_y_ctrl] = -0.5
         self.data.ctrl[self._cart_yaw_ctrl] = 0.0
 
-    def run(self, total_time: float = 300.0, use_viewer: bool = True,
-            show_trajectory: bool = True):
-        """Run the full pipeline."""
-        print("[TaskRunner] Starting pipeline...")
+    def _reset_runtime_state(self):
+        """Reset phase/executor bookkeeping without rebuilding model/data."""
+        self.state = 'IDLE'
+        self._phases = []
+        self._phase_index = 0
+        self._nav_start_time = None
+        self._nav_start_pos = None
+        self._nav_target = None
+        self._nav_start_yaw = None
+        self._nav_target_yaw = None
+        self._nav_move_duration = 0.0
+        self._nav_yaw_duration = 0.0
+        self._nav_speed = 0.3
+        self._nav_duration = 5.0
+        self._pending_L_skills = None
+        self._L_waiting_for_R = False
+        self._R_cleanup_pending = False
+        self._R_setup_skills = None
+        self._R_hold_position = None
+        for arm in self.arms.values():
+            arm.executor = None
+            arm.ctx = None
 
-        # Reset and initialize
+    def reset_scene(self):
+        """Reset MuJoCo data to the project's initial Scene5 state."""
         mujoco.mj_resetData(self.model, self.data)
         self._initialize_poses()
         mujoco.mj_forward(self.model, self.data)
 
-        # Reset trajectory recording
         self._tcp_L_history.clear()
         self._tcp_R_history.clear()
         self._traj_step_count = 0
 
-        # Initialize prev_sensor
         for arm in self.arms.values():
             arm.prev_sensor = self._get_arm_sensor(arm)
 
+        self._reset_runtime_state()
+        self._is_started = False
+
+    def set_llm_planner(self, llm_planner: Optional["DialogPlanner"]):
+        """Attach or replace the planner used by later web-dispatched tasks."""
+        self.llm_planner = llm_planner
+        if hasattr(llm_planner, 'attach_env'):
+            llm_planner.attach_env(
+                model=self.model,
+                data=self.data,
+                arm_offsets={'L': ARM_L_OFFSET, 'R': ARM_R_OFFSET},
+                arm_yaws={'L': ARM_L_YAW, 'R': ARM_R_YAW},
+                dof=DOF,
+            )
+
+    def start(
+        self,
+        total_time: float = 300.0,
+        show_trajectory: bool = True,
+        task_instruction: Optional[str] = None,
+        plan_dict: Optional[dict] = None,
+        llm_planner: Optional["DialogPlanner"] = None,
+    ):
+        """Start one pipeline task without opening the native MuJoCo viewer."""
+        print("[TaskRunner] Starting pipeline...")
+        if task_instruction is not None:
+            self.task_instruction = task_instruction
+        self.plan_dict = plan_dict
+        if llm_planner is not None:
+            self.set_llm_planner(llm_planner)
+
+        self.reset_scene()
+        self.state = 'INIT'
+        self._total_time = float(total_time)
+        self._show_trajectory = show_trajectory
+        self._is_started = True
+
+    @property
+    def is_active(self) -> bool:
+        return self._is_started and self.state not in ('DONE', 'TIMEOUT', 'FAILED')
+
+    def progress(self) -> float:
+        if self.state == 'DONE':
+            return 1.0
+        if self._total_time <= 0:
+            return 0.0
+        return float(min(max(self.data.time / self._total_time, 0.0), 1.0))
+
+    def step_once(self) -> bool:
+        """Advance the original project pipeline by exactly one MuJoCo step."""
+        if not self._is_started:
+            return False
+
+        if self.data.time > self._total_time:
+            self.state = 'TIMEOUT'
+            self._is_started = False
+            print(f"[TaskRunner] Timeout at t={self.data.time:.2f}s")
+            return False
+
+        t = self.data.time
+        self._update_state(t)
+
+        if self.state == 'DONE':
+            self._is_started = False
+            return False
+
+        self._apply_control_step(t)
+        mujoco.mj_step(self.model, self.data)
+        self._record_tcp_history()
+        return True
+
+    def _apply_control_step(self, t: float):
+        """Compute and write arm/gripper controls for the current pipeline step."""
+        for label, arm in self.arms.items():
+            if arm.executor and not arm.executor.is_all_complete:
+                arm.ctx.current_time = t
+                desired = arm.executor.get_desired_position(arm.ctx)
+            elif (label == 'R' and
+                  (self._R_cleanup_pending or self._L_waiting_for_R)):
+                desired = (self._R_hold_position
+                           if self._R_hold_position is not None
+                           else self._get_arm_sensor(arm))
+            else:
+                desired = INIT_Q
+
+            ctrl = self._compute_arm_control(arm, desired)
+
+            ctrl_start = self._L_ctrl_start if label == 'L' else self._R_ctrl_start
+            for i in range(DOF):
+                self.data.ctrl[ctrl_start + i] = ctrl[i]
+
+            gripper_ctrl = self._L_gripper_ctrl if label == 'L' else self._R_gripper_ctrl
+            gripper_target = arm.ctx.gripper_target if arm.ctx else 0.0
+            self.data.ctrl[gripper_ctrl] = gripper_target
+
+    def _record_tcp_history(self):
+        self._traj_step_count += 1
+        if self._traj_step_count % 10 != 0:
+            return
+        if self._tcp_L_site_id >= 0:
+            self._tcp_L_history.append(
+                self.data.site_xpos[self._tcp_L_site_id].copy())
+        if self._tcp_R_site_id >= 0:
+            self._tcp_R_history.append(
+                self.data.site_xpos[self._tcp_R_site_id].copy())
+
+    def run(self, total_time: float = 300.0, use_viewer: bool = True,
+            show_trajectory: bool = True):
+        """Run the full pipeline."""
         def step_loop():
-            while self.data.time <= total_time:
-                t = self.data.time
-                self._update_state(t)
-
-                if self.state == 'DONE':
-                    break
-
-                # Compute control for both arms
-                for label, arm in self.arms.items():
-                    if arm.executor and not arm.executor.is_all_complete:
-                        arm.ctx.current_time = t
-                        desired = arm.executor.get_desired_position(arm.ctx)
-                    elif (label == 'R' and
-                          (self._R_cleanup_pending or self._L_waiting_for_R)):
-                        desired = (self._R_hold_position
-                                   if self._R_hold_position is not None
-                                   else self._get_arm_sensor(arm))
-                    else:
-                        desired = INIT_Q
-
-                    ctrl = self._compute_arm_control(arm, desired)
-
-                    # Write control
-                    ctrl_start = self._L_ctrl_start if label == 'L' else self._R_ctrl_start
-                    for i in range(DOF):
-                        self.data.ctrl[ctrl_start + i] = ctrl[i]
-
-                    # Gripper
-                    gripper_ctrl = self._L_gripper_ctrl if label == 'L' else self._R_gripper_ctrl
-                    gripper_target = arm.ctx.gripper_target if arm.ctx else 0.0
-                    self.data.ctrl[gripper_ctrl] = gripper_target
-
-                mujoco.mj_step(self.model, self.data)
-
-                # Record TCP trajectory every 10 steps
-                self._traj_step_count += 1
-                if self._traj_step_count % 10 == 0:
-                    if self._tcp_L_site_id >= 0:
-                        self._tcp_L_history.append(
-                            self.data.site_xpos[self._tcp_L_site_id].copy())
-                    if self._tcp_R_site_id >= 0:
-                        self._tcp_R_history.append(
-                            self.data.site_xpos[self._tcp_R_site_id].copy())
-
+            self.start(total_time=total_time, show_trajectory=show_trajectory)
+            while self.step_once():
                 yield
 
         if use_viewer:

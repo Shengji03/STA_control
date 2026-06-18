@@ -1,1 +1,10 @@
 .env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+web_frontend/node_modules/
+web_frontend/dist/
+web_frontend/.vite/
+
+*.log
