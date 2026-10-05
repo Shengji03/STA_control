@@ -45,23 +45,3 @@ class Line:
 
     def get_point1(self) -> Point:
         return copy.deepcopy(self.point1)
-
-
-if __name__ == '__main__':
-    t0 = np.array([0.0, 0.0])
-    t1 = np.array([0.2, 0.2])
-
-    point0 = Point(t0)
-    point1 = Point(t1)
-
-    line = Line(point0, point1)
-    print('lengths: ', line.get_length())
-
-    line2 = Line()
-    print('lengths: ', line2.get_length())
-
-    line3 = Line((0, 0, 0), (1, 1, 1))
-    print('lengths: ', line3.get_length())
-
-    line4 = Line([0, 0, 0], [4, 4, 4])
-    print('lengths: ', line4.get_length())

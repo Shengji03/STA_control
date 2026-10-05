@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +12,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.llm_planner.dialog_planner import DialogPlanner
+from src.llm_planner.factory import create_planner
+from src.config.llm import LLMSettings
 from src.web_sim.mujoco_session import MujocoStreamSession, SimulationConfig
 
 from .config import BackendSettings
@@ -173,25 +174,14 @@ class SimulationRuntime:
             self._add_log("ERROR", f"任务 {task_id} {message}")
 
     def _build_llm_planner(self) -> DialogPlanner:
-        api_key = (
-            os.environ.get("STA_LLM_API_KEY")
-            or os.environ.get("DASHSCOPE_API_KEY")
-            or os.environ.get("DEEPSEEK_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-        )
-        if not api_key:
+        try:
+            settings = LLMSettings.from_env()
+        except ValueError as exc:
             raise HTTPException(
                 status_code=400,
-                detail="No LLM API key configured. Set STA_LLM_API_KEY before dispatching natural-language tasks.",
-            )
-        return DialogPlanner(
-            api_key=api_key,
-            base_url=os.environ.get(
-                "STA_LLM_BASE_URL",
-                "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            ),
-            model_name=os.environ.get("STA_LLM_MODEL", "qwen3.5-plus"),
-        )
+                detail=str(exc),
+            ) from exc
+        return create_planner(settings)
 
     def _add_log(self, level: str, message: str) -> None:
         with self._lock:

@@ -3,8 +3,10 @@ PlanExecutor: Converts LLM JSON plan into executable Skill objects.
 """
 
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 from spatialmath import SE3, SO3
+
+from ..config.robot import INITIAL_JOINTS, MOBILE_ROBOT
 
 from ..skills.skills import (
     MoveSkill, GraspSkill, RotateSkill,
@@ -42,7 +44,7 @@ class PlanExecutor:
         }
 
         # Initialize robots to default config
-        init_q = [0, 0, np.pi/2, 0, -np.pi/2, 0]
+        init_q = list(INITIAL_JOINTS)
         for robot in self._robots.values():
             robot.set_joint(init_q)
             robot.setRobotConfig(init_q)
@@ -180,7 +182,7 @@ class PlanExecutor:
                 sta_params=sta_params
             )
 
-    MAX_REACH = 0.85
+    MAX_REACH = MOBILE_ROBOT.arm_reach
 
     def _resolve_target_joints(
         self,
@@ -188,7 +190,7 @@ class PlanExecutor:
         target_pos: list,
         cart_pos: np.ndarray,
         orientation: Optional[SO3] = None,
-        tool_offset: float = 0.155
+        tool_offset: float = MOBILE_ROBOT.tool_offset
     ) -> Optional[np.ndarray]:
         """
         Convert world Cartesian [x,y,z] to joint angles [6 floats].

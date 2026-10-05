@@ -7,5 +7,9 @@ from .line import Line
 from .line_segment import LineSegment
 from .triangle import Triangle
 from .tetrahedron import Tetrahedron
-from .interface import *
-from .factory import *
+from .interface import Support
+
+__all__ = [
+    "Geometry", "Simplex", "Point", "Vector", "UnitVector", "Line", "LineSegment",
+    "Triangle", "Tetrahedron", "Support",
+]

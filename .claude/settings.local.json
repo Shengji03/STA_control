@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(ls -la /d/Desktop/STA_control/*.py)"
-    ]
-  }
-}

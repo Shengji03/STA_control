@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.claude/
 
 web_frontend/node_modules/
 web_frontend/dist/
@@ -11,3 +12,6 @@ web_frontend/.vite/
 *.pyc
 .idea/
 .superpowers/
+
+.venv/
+outputs/

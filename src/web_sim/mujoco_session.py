@@ -9,13 +9,10 @@ import mujoco
 import numpy as np
 
 from src.pipeline.task_runner import TaskRunner
+from src.config.paths import DEFAULT_SCENE_PATH, PROJECT_ROOT
 
 from .camera import CameraCommand, CameraState
 from .frame_codec import encode_jpeg
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SCENE_PATH = PROJECT_ROOT / "src" / "assets" / "scenes" / "scene5_glare.xml"
 
 
 @dataclass

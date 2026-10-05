@@ -1,0 +1,9 @@
+# Runtime and experiment dependencies. NumPy 1.x matches the validated robotics runtime.
+numpy>=1.26,<2
+mujoco>=3.3,<4
+roboticstoolbox-python>=1.1,<2
+spatialmath-python>=1.1,<2
+Pillow>=10
+openai>=1
+matplotlib>=3.8
+scipy>=1.11

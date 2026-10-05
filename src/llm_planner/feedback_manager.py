@@ -24,6 +24,7 @@ import mujoco
 import numpy as np
 
 from ..pipeline.plan_executor import PlanExecutor
+from ..config.robot import INITIAL_JOINTS
 
 
 class FeedbackManager:
@@ -252,7 +253,7 @@ class FeedbackManager:
     # 3) 碰撞校验: 把 phases 回放到一份临时 MjData 上
     # ------------------------------------------------------------------
 
-    INIT_Q = np.array([0, 0, np.pi / 2, 0, -np.pi / 2, 0])
+    INIT_Q = np.array(INITIAL_JOINTS)
 
     def _check_collisions(
         self, phases: List[Dict], snapshot: Dict

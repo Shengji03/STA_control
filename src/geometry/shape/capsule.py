@@ -3,7 +3,7 @@ from typing import List
 import numpy as np
 from spatialmath import SE3
 
-from .. import Geometry
+from ..simplex.geometry import Geometry
 from ..simplex import Point, UnitVector, Support
 from .geometry3d import Geometry3D
 

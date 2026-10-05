@@ -15,34 +15,20 @@ from ..controller.sta_controller.sta_controller import STAController
 from ..skills.skill_executor import SkillExecutor, SkillContext
 from ..skills.skills import MoveSkill
 from ..skills.base_skill import SkillType, SKILL_STA_PARAMS
-from ..robot.ur5e import UR5e
+from ..config.robot import DOF, INITIAL_JOINTS, MOBILE_ROBOT
+from .arm_state import ArmState
+from .navigation import NavigationTrajectory
 from .plan_executor import PlanExecutor
 
 
-# Scene5 hardcoded configuration
-ARM_L_OFFSET = np.array([0.35, 0.0, 0.35])
-ARM_R_OFFSET = np.array([-0.35, 0.0, 0.35])
-ARM_L_YAW = 0.0
-ARM_R_YAW = np.pi
-INIT_Q = np.array([0, 0, np.pi/2, 0, -np.pi/2, 0])
-SENSOR_L_OFFSET = 0
-SENSOR_R_OFFSET = 6
-DOF = 6
-
-
-class ArmState:
-    """State container for a single arm."""
-    def __init__(self, label: str, offset: np.ndarray, yaw: float, sensor_offset: int):
-        self.label = label
-        self.offset = offset
-        self.yaw = yaw
-        self.sensor_offset = sensor_offset
-        self.robot = UR5e()
-        self.robot.set_joint(INIT_Q)
-        self.sta_controllers = []
-        self.executor = None
-        self.ctx = None
-        self.prev_sensor = INIT_Q.copy()
+# Compatibility aliases backed by shared Scene5 settings.
+ARM_L_OFFSET = np.array(MOBILE_ROBOT.left_offset)
+ARM_R_OFFSET = np.array(MOBILE_ROBOT.right_offset)
+ARM_L_YAW = MOBILE_ROBOT.left_yaw
+ARM_R_YAW = MOBILE_ROBOT.right_yaw
+INIT_Q = np.array(INITIAL_JOINTS)
+SENSOR_L_OFFSET = MOBILE_ROBOT.left_sensor_offset
+SENSOR_R_OFFSET = MOBILE_ROBOT.right_sensor_offset
 
 
 class TaskRunner:
@@ -112,21 +98,6 @@ class TaskRunner:
                 STAController(10, 25, 15, ts=ts) for _ in range(DOF)
             ]
 
-        # State machine
-        self.state = 'INIT'
-        self._phases = []
-        self._phase_index = 0
-        self._nav_start_time = None
-        self._nav_start_pos = None
-        self._nav_target = None
-        self._nav_speed = 0.3
-        self._nav_duration = 5.0
-        self._pending_L_skills = None
-        self._L_waiting_for_R = False
-        self._R_cleanup_pending = False
-        self._R_setup_skills = None
-        self._R_hold_position = None
-
         # TCP site IDs for trajectory recording
         self._tcp_L_site_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SITE, 'tcp')
@@ -171,8 +142,6 @@ class TaskRunner:
         """Perception -> LLM -> Parse plan, with retry on failure."""
         print("[TaskRunner] Planning...")
 
-        snapshot = self.perception.get_scene_snapshot()
-
         if self.plan_dict:
             plan_result = self.plan_dict
             self._try_parse_plan(plan_result)
@@ -181,6 +150,7 @@ class TaskRunner:
         if not self.llm_planner:
             raise ValueError("No LLM planner or plan_dict provided")
 
+        snapshot = self.perception.get_scene_snapshot()
         error_feedback = ""
         for attempt in range(1 + self._MAX_PLAN_RETRIES):
             plan_result = self.llm_planner.plan(
@@ -342,53 +312,26 @@ class TaskRunner:
             self.data.qpos[self._cart_y_qpos]
         ])
 
-    _YAW_SPEED = 0.5
-
     def _start_navigation(self, target: list, yaw: float = None):
-        """Begin navigation: move to [x,y] first, then rotate yaw in place."""
-        self._nav_start_pos = self._get_cart_state()
-        self._nav_target = np.array(target)
-        self._nav_start_time = self.data.time
-        self._nav_start_yaw = self.data.qpos[self._cart_yaw_qpos]
-        self._nav_target_yaw = yaw
-
-        dist = np.linalg.norm(self._nav_target - self._nav_start_pos)
-        self._nav_move_duration = max(dist / self._nav_speed, 2.0) if dist > 0.05 else 0.0
-
-        if yaw is not None and abs(yaw - self._nav_start_yaw) > 0.01:
-            yaw_diff = abs(yaw - self._nav_start_yaw)
-            self._nav_yaw_duration = max(yaw_diff / self._YAW_SPEED, 2.0)
-        else:
-            self._nav_yaw_duration = 0.0
-
-        self._nav_duration = max(self._nav_move_duration + self._nav_yaw_duration, 2.0)
-
-        move_info = f"移动{dist:.2f}m/{self._nav_move_duration:.1f}s"
-        yaw_info = f" -> 原地转向{self._nav_start_yaw:.2f}->{yaw:.2f}/{self._nav_yaw_duration:.1f}s" if self._nav_yaw_duration > 0 else ""
-        print(f"[TaskRunner] Nav: {self._nav_start_pos} -> {self._nav_target} "
-              f"({move_info}{yaw_info})")
+        """Create a move-then-turn profile from the current cart pose."""
+        self._navigation = NavigationTrajectory(
+            start=self._get_cart_state(), target=np.array(target),
+            start_time=self.data.time,
+            start_yaw=float(self.data.qpos[self._cart_yaw_qpos]),
+            target_yaw=yaw,
+        )
+        print(f"[TaskRunner] Nav: {self._navigation.start} -> "
+              f"{self._navigation.target}, duration={self._navigation.duration:.1f}s")
 
     def _update_navigation(self, t: float):
-        """Phase 1: move to position. Phase 2: rotate yaw in place."""
-        if self._nav_start_time is None:
+        """Write the navigation profile to the existing cart actuators."""
+        if self._navigation is None:
             return
-
-        elapsed = t - self._nav_start_time
-
-        if self._nav_move_duration > 0 and elapsed < self._nav_move_duration:
-            s = elapsed / self._nav_move_duration
-            current = self._nav_start_pos + s * (self._nav_target - self._nav_start_pos)
-            self.data.ctrl[self._cart_x_ctrl] = current[0]
-            self.data.ctrl[self._cart_y_ctrl] = current[1]
-        else:
-            self.data.ctrl[self._cart_x_ctrl] = self._nav_target[0]
-            self.data.ctrl[self._cart_y_ctrl] = self._nav_target[1]
-
-            if self._nav_yaw_duration > 0 and self._nav_target_yaw is not None:
-                yaw_elapsed = elapsed - self._nav_move_duration
-                s_yaw = min(yaw_elapsed / self._nav_yaw_duration, 1.0)
-                current_yaw = self._nav_start_yaw + s_yaw * (self._nav_target_yaw - self._nav_start_yaw)
-                self.data.ctrl[self._cart_yaw_ctrl] = current_yaw
+        position, yaw = self._navigation.sample(t)
+        self.data.ctrl[self._cart_x_ctrl] = position[0]
+        self.data.ctrl[self._cart_y_ctrl] = position[1]
+        if yaw is not None:
+            self.data.ctrl[self._cart_yaw_ctrl] = yaw
 
     def _cart_reached(self, target: np.ndarray) -> bool:
         """Check if cart reached target."""
@@ -424,8 +367,10 @@ class TaskRunner:
 
         elif self.state == 'PHASE_NAV':
             self._update_navigation(t)
-            if t - self._nav_start_time >= self._nav_duration:
-                if self._cart_reached(self._nav_target):
+            navigation = self._navigation
+            if (navigation is not None
+                    and t - navigation.start_time >= navigation.duration):
+                if self._cart_reached(navigation.target):
                     self._start_phase_execution(self._phase_index)
 
         elif self.state == 'PHASE_EXEC':
@@ -499,105 +444,19 @@ class TaskRunner:
 
     @staticmethod
     def _draw_trajectory(user_scn, points, rgba, sphere_size=0.008):
-        """Draw trajectory points and line segments in MuJoCo viewer."""
-        max_geom = user_scn.maxgeom
-        for i, pt in enumerate(points):
-            if user_scn.ngeom >= max_geom - 2:
-                break
-            g_idx = user_scn.ngeom
-            mujoco.mjv_initGeom(
-                user_scn.geoms[g_idx],
-                mujoco.mjtGeom.mjGEOM_SPHERE,
-                np.zeros(3),
-                pt.astype(np.float64),
-                np.zeros(9),
-                np.array(rgba, dtype=np.float32),
-            )
-            user_scn.geoms[g_idx].size[:] = [sphere_size, 0, 0]
-            user_scn.ngeom += 1
-
-            if i > 0 and user_scn.ngeom < max_geom:
-                prev = points[i - 1]
-                mid = (pt + prev) * 0.5
-                diff = pt - prev
-                length = float(np.linalg.norm(diff))
-                if length < 1e-6:
-                    continue
-                g_idx2 = user_scn.ngeom
-                mujoco.mjv_initGeom(
-                    user_scn.geoms[g_idx2],
-                    mujoco.mjtGeom.mjGEOM_CAPSULE,
-                    np.array([0.003, length / 2, 0]),
-                    mid.astype(np.float64),
-                    np.zeros(9),
-                    np.array(rgba, dtype=np.float32),
-                )
-                d = diff / length
-                up = np.array([0.0, 0.0, 1.0])
-                if abs(np.dot(d, up)) > 0.99:
-                    up = np.array([1.0, 0.0, 0.0])
-                right = np.cross(up, d)
-                right /= np.linalg.norm(right)
-                up2 = np.cross(d, right)
-                rot = np.array([right, up2, d]).T
-                user_scn.geoms[g_idx2].mat[:] = rot
-                user_scn.ngeom += 1
+        from ..visualization.trajectories import draw_trajectory
+        draw_trajectory(user_scn, points, rgba, sphere_size)
 
     def _plot_trajectory_3d(self):
-        """Plot TCP trajectories in 3D after simulation."""
-        if not self._tcp_L_history and not self._tcp_R_history:
-            return
-        try:
-            import matplotlib
-            matplotlib.rcParams['font.sans-serif'] = [
-                'SimHei', 'Microsoft YaHei', 'DejaVu Sans']
-            matplotlib.rcParams['axes.unicode_minus'] = False
-            import matplotlib.pyplot as plt
-        except ImportError:
-            print("[TaskRunner] matplotlib not available, skipping 3D plot")
-            return
-
-        fig = plt.figure(figsize=(12, 8))
-        ax = fig.add_subplot(111, projection='3d')
-
-        if self._tcp_L_history:
-            pts = np.array(self._tcp_L_history)
-            ax.plot(pts[:, 0], pts[:, 1], pts[:, 2],
-                    'r-', linewidth=1.5, alpha=0.8, label='L臂 (主臂)')
-            ax.scatter(*pts[0], color='red', s=80, marker='o',
-                       edgecolors='black', zorder=5)
-            ax.scatter(*pts[-1], color='red', s=80, marker='s',
-                       edgecolors='black', zorder=5)
-
-        if self._tcp_R_history:
-            pts = np.array(self._tcp_R_history)
-            ax.plot(pts[:, 0], pts[:, 1], pts[:, 2],
-                    'b-', linewidth=1.5, alpha=0.8, label='R臂 (从臂)')
-            ax.scatter(*pts[0], color='blue', s=80, marker='o',
-                       edgecolors='black', zorder=5)
-            ax.scatter(*pts[-1], color='blue', s=80, marker='s',
-                       edgecolors='black', zorder=5)
-
-        pipe_x = np.linspace(-1, 4, 50)
-        ax.plot(pipe_x, [0.4] * 50, [0.5] * 50,
-                'gray', linewidth=3, alpha=0.3, label='管道A')
-
-        ax.set_xlabel('X (m)')
-        ax.set_ylabel('Y (m)')
-        ax.set_zlabel('Z (m)')
-        ax.set_title('双臂末端TCP轨迹')
-        ax.legend(loc='upper left')
-        plt.tight_layout()
-        plt.savefig('tcp_trajectory_3d.png', dpi=150)
-        print("[TaskRunner] 轨迹图已保存: tcp_trajectory_3d.png")
-        plt.show()
+        from ..visualization.trajectories import plot_tcp_trajectories
+        plot_tcp_trajectories(self._tcp_L_history, self._tcp_R_history)
 
     def _initialize_poses(self):
         """Set initial cart and arm positions in qpos."""
         # Cart start position
-        self.data.qpos[self._cart_x_qpos] = -3.0
-        self.data.qpos[self._cart_y_qpos] = -0.5
-        self.data.qpos[self._cart_yaw_qpos] = 0.0
+        self.data.qpos[self._cart_x_qpos] = MOBILE_ROBOT.cart_start[0]
+        self.data.qpos[self._cart_y_qpos] = MOBILE_ROBOT.cart_start[1]
+        self.data.qpos[self._cart_yaw_qpos] = MOBILE_ROBOT.cart_start[2]
 
         # Arm initial poses
         for i in range(DOF):
@@ -605,24 +464,16 @@ class TaskRunner:
             self.data.qpos[self._R_qpos_start + i] = INIT_Q[i]
 
         # Set cart actuator targets
-        self.data.ctrl[self._cart_x_ctrl] = -3.0
-        self.data.ctrl[self._cart_y_ctrl] = -0.5
-        self.data.ctrl[self._cart_yaw_ctrl] = 0.0
+        self.data.ctrl[self._cart_x_ctrl] = MOBILE_ROBOT.cart_start[0]
+        self.data.ctrl[self._cart_y_ctrl] = MOBILE_ROBOT.cart_start[1]
+        self.data.ctrl[self._cart_yaw_ctrl] = MOBILE_ROBOT.cart_start[2]
 
     def _reset_runtime_state(self):
         """Reset phase/executor bookkeeping without rebuilding model/data."""
         self.state = 'IDLE'
         self._phases = []
         self._phase_index = 0
-        self._nav_start_time = None
-        self._nav_start_pos = None
-        self._nav_target = None
-        self._nav_start_yaw = None
-        self._nav_target_yaw = None
-        self._nav_move_duration = 0.0
-        self._nav_yaw_duration = 0.0
-        self._nav_speed = 0.3
-        self._nav_duration = 5.0
+        self._navigation = None
         self._pending_L_skills = None
         self._L_waiting_for_R = False
         self._R_cleanup_pending = False
@@ -755,7 +606,8 @@ class TaskRunner:
             show_trajectory: bool = True):
         """Run the full pipeline."""
         def step_loop():
-            self.start(total_time=total_time, show_trajectory=show_trajectory)
+            self.start(total_time=total_time, show_trajectory=show_trajectory,
+                       plan_dict=self.plan_dict)
             while self.step_once():
                 yield
 

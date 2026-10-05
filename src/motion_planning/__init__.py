@@ -1,5 +1,5 @@
-from .trajectory_planning import *
+"""Motion primitives used by the current task and experiment code."""
 
-from src.interface import Strategy
+from .joint_trajectory import JointTrajectory
 
-Strategy.factory_register()
+__all__ = ["JointTrajectory"]

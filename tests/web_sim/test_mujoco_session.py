@@ -91,3 +91,19 @@ def test_mujoco_stream_session_dispatches_pipeline_task():
     assert after["id"] == "LAB-TEST"
     assert after["runner_state"] in {"PHASE_NAV", "PHASE_EXEC", "DONE"}
     assert after["progress"] > before["progress"]
+
+
+def test_runner_run_preserves_preloaded_plan_without_llm():
+    scene = Path("src/assets/scenes/scene5_glare.xml").resolve()
+    session = MujocoStreamSession(SimulationConfig(scene_path=scene, width=80, height=60))
+    plan = {"plan": [{
+        "arm": "L", "skill": "NavSkill", "params": {"target": [-2.99, -0.5]},
+    }]}
+    try:
+        session.runner.plan_dict = plan
+        session.runner.run(total_time=3.0, use_viewer=False, show_trajectory=False)
+        assert session.runner.state == "DONE"
+        assert session.runner.plan_dict is plan
+        assert session.runner.progress() == 1.0
+    finally:
+        session.close()

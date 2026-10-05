@@ -1,0 +1,2 @@
+-r requirements-web.txt
+pytest>=8

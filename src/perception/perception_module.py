@@ -16,6 +16,8 @@ from typing import Dict, List, Optional, Tuple
 import mujoco
 import numpy as np
 
+from ..config.robot import MOBILE_ROBOT
+
 from .object_registry import SceneObjectRegistry
 from .world_state import WorldStateBuilder
 
@@ -254,9 +256,9 @@ class PerceptionModule:
                 visible.append(cam_name)
         return visible
 
-    _ARM_L_OFFSET = np.array([0.35, 0.0, 0.35])
-    _ARM_R_OFFSET = np.array([-0.35, 0.0, 0.35])
-    _ARM_REACH = 0.85
+    _ARM_L_OFFSET = np.array(MOBILE_ROBOT.left_offset)
+    _ARM_R_OFFSET = np.array(MOBILE_ROBOT.right_offset)
+    _ARM_REACH = MOBILE_ROBOT.arm_reach
 
     def _build_planner_state(self, world_state: Dict) -> Dict:
         planner_state = {

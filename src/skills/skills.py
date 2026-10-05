@@ -1,7 +1,7 @@
 """
 具体技能实现
 
-7种基本技能:
+6种基本技能:
     - MoveSkill:      关节空间点到点移动 (纯位置控制)
     - GraspSkill:     夹取 / 释放 (纯位置控制)
     - InsertSkill:    精确插入 (力位混合: 导纳+位置)
@@ -13,10 +13,7 @@
 import numpy as np
 
 from .base_skill import BaseSkill, SkillType
-from src.motion_planning import (
-    TrajectoryParameter, TrajectoryPlanner,
-    JointParameter, CubicVelocityParameter,
-)
+from src.motion_planning import JointTrajectory
 from src.controller.admittance_controller import (
     AdmittanceController, AdmittanceMode,
 )
@@ -24,10 +21,7 @@ from src.controller.admittance_controller import (
 
 def _create_joint_trajectory(start_q, end_q, duration):
     """创建关节空间轨迹"""
-    joint_param = JointParameter(start_q, end_q)
-    velocity_param = CubicVelocityParameter(duration)
-    trajectory_param = TrajectoryParameter(joint_param, velocity_param)
-    return TrajectoryPlanner(trajectory_param)
+    return JointTrajectory(start_q, end_q, duration)
 
 
 # ============================================================================
@@ -108,7 +102,7 @@ class AdmittanceTrajectorySkill(TrajectorySkill):
 
 
 # ============================================================================
-# 7 种具体技能
+# 6 种具体技能
 # ============================================================================
 
 class MoveSkill(TrajectorySkill):
