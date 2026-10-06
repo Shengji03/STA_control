@@ -1,56 +1,83 @@
 <script setup lang="ts">
-import { computed } from "vue";
-
 import { useSimulationStore } from "../stores/simulation";
-
+import AppIcon from "./AppIcon.vue";
+import { executeTask, errorMessage } from "../api/http";
 const simulation = useSimulationStore();
-
-interface CameraButton {
-  label: string;
-  action?: "reset";
-  camera?: string;
-}
-
-const cameraButtons = computed<CameraButton[]>(() => [
-  { label: "自由", action: "reset" },
-  ...simulation.status.available_cameras.map((camera) => ({ label: camera, camera })),
-]);
-
-function setCamera(item: CameraButton): void {
-  if (item.action === "reset") {
-    void simulation.sendCamera({ action: "reset" });
-    return;
-  }
-  if (item.camera) {
-    void simulation.sendCamera({ action: "set_fixed", camera: item.camera });
+const cameraNames: Record<string, string> = {
+  cam_global: "全景",
+  cam_overview: "总览",
+  cam_side: "侧视",
+  cam_valve: "阀门",
+  cam_bird: "俯视",
+  cam_shade: "遮光",
+};
+async function execute() {
+  if (!simulation.task) return;
+  try {
+    await executeTask(simulation.task.id);
+    await simulation.refreshStatus();
+  } catch (e) {
+    simulation.lastError = errorMessage(e);
   }
 }
 </script>
-
 <template>
-  <aside class="control-column" aria-label="仿真控制">
-    <section class="panel-block">
-      <h2>运行控制</h2>
-      <div class="button-grid">
-        <button type="button" @click="simulation.sendControl('pause')">|| 暂停</button>
-        <button type="button" @click="simulation.sendControl('resume')">▶ 继续</button>
-        <button type="button" @click="simulation.sendControl('reset')">↻ 重置</button>
-      </div>
-    </section>
-
-    <section class="panel-block">
-      <h2>相机</h2>
-      <div class="camera-grid">
-        <button
-          v-for="item in cameraButtons"
-          :key="item.camera || item.action"
-          type="button"
-          :class="{ active: simulation.cameraName === (item.camera || 'free') }"
-          @click="setCamera(item)"
-        >
-          {{ item.label }}
-        </button>
-      </div>
-    </section>
-  </aside>
+  <section class="panel control-panel">
+    <div class="control-actions">
+      <button
+        v-if="simulation.task?.status === 'planned'"
+        class="primary"
+        @click="execute"
+      >
+        <AppIcon name="play" />执行计划</button
+      ><button
+        :disabled="simulation.task?.status !== 'running'"
+        @click="simulation.sendControl('pause')"
+      >
+        <AppIcon name="pause" />暂停</button
+      ><button
+        :disabled="simulation.task?.status !== 'paused'"
+        @click="simulation.sendControl('resume')"
+      >
+        <AppIcon name="play" />继续</button
+      ><button
+        :disabled="!simulation.status.active_task"
+        class="danger-quiet"
+        @click="simulation.sendControl('stop')"
+      >
+        <AppIcon name="stop" />停止任务</button
+      ><button
+        :disabled="!!simulation.status.active_task"
+        @click="simulation.sendControl('reset')"
+      >
+        <AppIcon name="reset" />重置场景
+      </button>
+    </div>
+    <div class="camera-row">
+      <AppIcon name="camera" /><span>视角</span
+      ><button
+        :class="{ selected: simulation.cameraName === 'free' }"
+        @click="simulation.sendCamera({ action: 'reset' })"
+      >
+        自由</button
+      ><button
+        v-for="camera in simulation.status.available_cameras"
+        :key="camera"
+        :class="{ selected: simulation.cameraName === camera }"
+        @click="simulation.sendCamera({ action: 'set_fixed', camera })"
+      >
+        {{ cameraNames[camera] || camera }}</button
+      ><button
+        aria-label="放大画面"
+        @click="simulation.sendCamera({ action: 'zoom', amount: -0.4 })"
+      >
+        ＋</button
+      ><button
+        aria-label="缩小画面"
+        @click="simulation.sendCamera({ action: 'zoom', amount: 0.4 })"
+      >
+        −
+      </button>
+    </div>
+  </section>
 </template>

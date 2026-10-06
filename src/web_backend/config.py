@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.config.paths import DEFAULT_FRONTEND_DIST, DEFAULT_SCENE_PATH, PROJECT_ROOT
+from src.config.paths import DEFAULT_FRONTEND_DIST, DEFAULT_SCENE_PATH, OUTPUTS_DIR
 
 
 @dataclass(frozen=True)
@@ -12,4 +12,5 @@ class BackendSettings:
     height: int = 540
     fps: int = 20
     jpeg_quality: int = 80
+    data_dir: Path = OUTPUTS_DIR / 'web'
 

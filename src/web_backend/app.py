@@ -2,373 +2,327 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import datetime
+import json
+from math import pi
 from pathlib import Path
 from threading import RLock, Thread
-from typing import Any
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from src.llm_planner.dialog_planner import DialogPlanner
-from src.llm_planner.factory import create_planner
 from src.config.llm import LLMSettings
+from src.llm_planner.factory import create_planner
 from src.web_sim.mujoco_session import MujocoStreamSession, SimulationConfig
-
+from src.web_sim.worker import SimulationWorker
 from .config import BackendSettings
-from .schemas import (
-    CameraRequest,
-    ControlRequest,
-    HealthResponse,
-    LogRecord,
-    SimulationStatus,
-    TaskDispatchRequest,
-    TaskRecord,
-)
+from .schemas import (CameraRequest, ControlRequest, HealthResponse, LogRecord, OverlayRequest,
+                      ReplayRequest, SimulationStatus, TaskDispatchRequest, TaskRecord)
+from .storage import TaskRepository
+
+
+def scenarios():
+    def goal(gid, obj, shade='none'):
+        return {'id': gid, 'object': obj, 'operation': 'rotate', 'angle': pi,
+                'shade': shade, 'preferred_arm': 'L'}
+    return [
+        {'id': 'shade', 'name': '遮光协作', 'description': 'R 臂持板，L 臂旋拧，操作完成后放回',
+         'instruction': '遮光并旋拧1号阀门180度', 'scene': 'scene5_glare.xml',
+         'plan': {'goals': [goal('v1', 'valve_1', 'required')],
+                  'stages': [{'nav': {'target': [.45, 0]}, 'goals': ['v1']}]}},
+        {'id': 'valve', 'name': '单阀门操作', 'description': '自动选择主操作臂，旋转 180°',
+         'instruction': '旋拧1号阀门180度', 'scene': 'scene5_glare.xml',
+         'plan': {'goals': [goal('v1', 'valve_1')],
+                  'stages': [{'nav': {'target': [.45, 0]}, 'goals': ['v1']}]}},
+        {'id': 'two-valves', 'name': '双目标作业', 'description': '保留两个必做目标，依次导航与操作',
+         'instruction': '依次旋拧1号和2号阀门180度', 'scene': 'scene5_glare.xml',
+         'plan': {'goals': [goal('v1', 'valve_1'), goal('v2', 'valve_2')],
+                  'stages': [{'nav': {'target': [.45, 0]}, 'goals': ['v1']},
+                             {'nav': {'target': [3.5, 0]}, 'goals': ['v2']}]}},
+    ]
 
 
 class SimulationRuntime:
-    def __init__(self, settings: BackendSettings, enabled: bool):
-        self.settings = settings
-        self.enabled = enabled
-        self.session: MujocoStreamSession | None = None
+    def __init__(self, settings, enabled):
+        self.settings, self.enabled = settings, enabled
+        self.worker = None
+        self.session = None
         self._lock = RLock()
-        self._task_counter = 0
-        self._log_counter = 0
-        self._tasks: list[TaskRecord] = []
-        self._logs: list[LogRecord] = []
-        self._add_log("INFO", "FastAPI 服务已启动")
-        if enabled:
-            config = SimulationConfig(
-                scene_path=settings.scene_path,
-                width=settings.width,
-                height=settings.height,
-                fps=settings.fps,
-                jpeg_quality=settings.jpeg_quality,
-            )
-            self.session = MujocoStreamSession(config)
-            self._add_log("INFO", "MuJoCo 渲染流等待连接")
-        else:
-            self._add_log("WARN", "MuJoCo 仿真会话已禁用")
+        self._dispatch_lock = RLock()
+        self._replay_cache = None
+        self.repository = TaskRepository(settings.data_dir)
+        self._tasks = [TaskRecord(**item) for item in self.repository.tasks()]
+        for index, task in enumerate(self._tasks):
+            if task.status in ('planning', 'planned', 'running', 'paused'):
+                self._tasks[index] = task.model_copy(update={'status': 'interrupted', 'message': '服务重启，原任务未继续执行'})
+                self.repository.save(self._tasks[index].model_dump())
+        self._logs = []
+        self._add_log('INFO', '服务就绪，仿真由独立线程驱动')
 
-    def status(self) -> SimulationStatus:
-        self._sync_completed_tasks()
-        if self.session is None:
-            return SimulationStatus(state="disabled")
-        return SimulationStatus(**self.session.get_status())
+    def start(self):
+        if self.enabled:
+            config = SimulationConfig(scene_path=self.settings.scene_path, width=self.settings.width,
+                                      height=self.settings.height, fps=self.settings.fps,
+                                      jpeg_quality=self.settings.jpeg_quality)
+            self.worker = SimulationWorker(config, self._receive_event)
+            self.worker.start()
+            self.session = self.worker.session
+            self._add_log('INFO', 'MuJoCo 画面与任务运行已就绪')
 
-    def control(self, request: ControlRequest) -> SimulationStatus:
-        if self.session is None:
-            return self.status()
-        if request.action == "pause":
-            self.session.pause()
-        elif request.action == "resume":
-            self.session.resume()
-        elif request.action == "reset":
-            self.session.reset()
+    def _call(self, method, *args, **kwargs):
+        if not self.worker: raise HTTPException(409, 'MuJoCo 仿真会话未启用')
+        try: return self.worker.call(method, *args, **kwargs)
+        except ValueError as exc: raise HTTPException(409, str(exc)) from exc
+        except (RuntimeError, FutureTimeoutError) as exc:
+            raise HTTPException(503, str(exc) or '仿真服务响应超时，请检查运行日志') from exc
+
+    def status(self):
+        if not self.worker: return SimulationStatus(state='disabled')
+        return SimulationStatus(**self.worker.snapshot()[1])
+
+    def control(self, request):
+        if not self.worker: return self.status()
+        with self._dispatch_lock:
+            self._call({'pause': 'pause', 'resume': 'resume', 'reset': 'reset', 'stop': 'stop'}[request.action])
+            status = self.status()
+            if status.active_task and status.active_task['status'] in ('running', 'paused'):
+                self._update_task(status.active_task['id'], status=status.active_task['status'])
+            return status
+
+    def camera(self, request):
+        if self.worker: self._call('apply_camera_command', request.model_dump())
         return self.status()
 
-    def camera(self, request: CameraRequest) -> SimulationStatus:
-        if self.session is None:
-            return self.status()
-        self.session.apply_camera_command(request.model_dump())
-        return self.status()
-
-    def dispatch_task(self, request: TaskDispatchRequest) -> TaskRecord:
-        if self.session is None:
-            self._add_log("ERROR", "任务下发失败：MuJoCo 仿真会话未启用")
-            raise HTTPException(status_code=409, detail="Simulation session is disabled")
-
+    def dispatch_task(self, request):
+        if not self.worker: raise HTTPException(409, 'Simulation session is disabled')
         instruction = request.instruction.strip()
-        if not instruction and request.plan is None:
-            raise HTTPException(status_code=400, detail="Task instruction or plan is required")
-        if not instruction:
-            instruction = "执行预置计划"
-        task_id = self._next_task_id()
-        is_preplanned = request.plan is not None
-        task = TaskRecord(
-            id=task_id,
-            instruction=instruction,
-            scene=request.scene,
-            mode=request.mode,
-            status="running" if is_preplanned else "planning",
-            created_at=self._now(),
-            message="任务已下发到 TaskRunner 执行队列" if is_preplanned else "任务已创建，等待 LLM 规划",
-        )
-        total_time = max(request.total_time, 1.0)
-
-        try:
-            if request.plan is not None:
-                self.session.dispatch_pipeline_task(
-                    task_id=task_id,
-                    instruction=instruction,
-                    total_time=total_time,
-                    plan_dict=request.plan,
-                )
-            else:
-                self.session.start_planning_task(
-                    task_id=task_id,
-                    instruction=instruction,
-                    total_time=total_time,
-                )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        self._insert_task(task)
-        self._add_log("INFO", f"任务 {task_id} 已下发：{instruction}")
-        if request.plan is not None:
-            self._add_log("INFO", f"任务 {task_id} 已进入 TaskRunner 执行队列")
-        else:
-            self._add_log("INFO", f"任务 {task_id} 已进入 LLM 规划队列")
-            self._start_planning_thread(task_id, instruction)
+        if not instruction and request.plan is None: raise HTTPException(400, 'Task instruction or plan is required')
+        instruction = instruction or '执行预置计划'
+        task_id = 'LAB-' + datetime.now().strftime('%Y%m%d-%H%M%S-') + uuid4().hex[:6]
+        # Reserve on the single simulation owner before storing/starting a job.
+        with self._dispatch_lock:
+            self._call('configure_task', request.scene, request.fps, request.record_tcp)
+            self._call('start_planning_task', task_id=task_id, instruction=instruction, total_time=request.total_time)
+            task = TaskRecord(id=task_id, instruction=instruction, scene=request.scene, mode=request.mode,
+                              status='planning', created_at=self._now(), message='正在生成并校验任务计划')
+            with self._lock:
+                self._tasks.insert(0, task)
+                self.repository.save(task.model_dump())
+            planning_input = self._call('planning_input')
+            self._replay_cache = None
+        self._add_log('INFO', f'任务 {task_id} 已进入 LLM 规划队列' if request.plan is None else f'任务 {task_id} 开始预置计划校验')
+        Thread(target=self._plan, args=(task_id, request, planning_input), name='sta-task-planner', daemon=True).start()
         return task
 
-    def task_history(self) -> list[TaskRecord]:
-        self._sync_completed_tasks()
-        with self._lock:
-            return list(self._tasks)
-
-    def logs(self) -> list[LogRecord]:
-        self._sync_completed_tasks()
-        with self._lock:
-            return list(self._logs)
-
-    def close(self) -> None:
-        if self.session is not None:
-            self.session.close()
-
-    def _sync_completed_tasks(self) -> None:
-        if self.session is None:
-            return
-        for event in self.session.consume_task_events():
-            task_id = event["task_id"]
-            changed = self._update_task(task_id, status=event["status"], message=event["message"],
-                                        optimization=event.get('optimization'),
-                                        execution_effects=event.get('execution_effects'))
-            if changed:
-                level = "INFO" if event["status"] == "completed" else "ERROR"
-                self._add_log(level, f"任务 {task_id} {event['message']}")
-
-    def _start_planning_thread(self, task_id: str, instruction: str) -> None:
-        thread = Thread(
-            target=self._run_planning_job,
-            args=(task_id, instruction),
-            daemon=True,
-            name=f"sta-llm-planner-{task_id}",
-        )
-        thread.start()
-
-    def _run_planning_job(self, task_id: str, instruction: str) -> None:
-        if self.session is None:
-            return
-        self._add_log("INFO", f"任务 {task_id} 开始 LLM 规划")
+    def _plan(self, task_id, request, planning_input):
         try:
-            llm_planner = self._build_llm_planner()
-            plan_dict = self.session.create_plan_with_llm(instruction, llm_planner)
-            self.session.activate_planned_task(task_id, plan_dict)
-            self._update_task(task_id, status="running", message="LLM 与次模分工规划完成，任务执行中",
-                              optimization=plan_dict.get('optimization'))
-            self._add_log("INFO", f"任务 {task_id} LLM 规划完成，已进入 TaskRunner 执行队列")
+            if request.plan is None:
+                plan = MujocoStreamSession.plan_from_input(planning_input, request.instruction, self._build_llm_planner())
+            else:
+                class FixedPlanner:
+                    def plan(self, *_args, **_kwargs): return request.plan
+                plan = MujocoStreamSession.plan_from_input(planning_input, request.instruction, FixedPlanner())
+            # The task ID check rejects stale planning results after stop/reset.
+            status = self._call('activate_planned_task', task_id, plan, execute=request.mode == '实时仿真')
+            detail = self._call('detail')
+            self._update_task(task_id, status=status['status'], message=status['message'], optimization=plan.get('optimization'))
+            if detail.get('task_id') == task_id:
+                self.repository.save(self._find(task_id).model_dump(), detail)
+            self._add_log('INFO', f'任务 {task_id} 分工和可执行性校验通过')
         except Exception as exc:
-            message = self._format_planning_error(exc)
-            self.session.fail_planning_task(task_id, message)
-            self._update_task(task_id, status="failed", message=message)
-            self._add_log("ERROR", f"任务 {task_id} {message}")
+            task = self._find(task_id)
+            if task and task.status not in ('cancelled', 'completed', 'interrupted'):
+                message = 'LLM 规划失败：' + (str(exc.detail) if isinstance(exc, HTTPException) else str(exc))
+                try: self._call('fail_planning_task', task_id, message)
+                except Exception: pass
+                self._update_task(task_id, status='failed', message=message)
+                self._add_log('ERROR', f'任务 {task_id} {message}')
 
-    def _build_llm_planner(self) -> DialogPlanner:
-        try:
-            settings = LLMSettings.from_env()
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=str(exc),
-            ) from exc
-        return create_planner(settings)
+    def execute(self, task_id):
+        with self._dispatch_lock:
+            payload = self._call('execute_planned', task_id)
+            self._update_task(task_id, status='running', mode='实时仿真', message='任务正在执行')
+            return payload
 
-    def _add_log(self, level: str, message: str) -> None:
-        with self._lock:
-            self._log_counter += 1
-            self._logs.insert(
-                0,
-                LogRecord(
-                    id=f"LOG-{self._log_counter:04d}",
-                    timestamp=self._now(),
-                    level=level,
-                    message=message,
-                ),
-            )
+    def _receive_event(self, event):
+        detail = event.get('detail', {})
+        self._update_task(event['task_id'], status=event['status'], message=event['message'],
+                          optimization=event.get('optimization'), execution_effects=event.get('execution_effects'),
+                          metrics=detail.get('metrics'), sample_count=len(detail.get('samples', [])), completed_at=self._now())
+        task = self._find(event['task_id'])
+        if task: self.repository.save(task.model_dump(), detail)
+        self._add_log('INFO' if event['status'] == 'completed' else 'WARN', f"{event['task_id']} {event['message']}")
 
-    def _next_task_id(self) -> str:
-        with self._lock:
-            self._task_counter += 1
-            return f"LAB-{self._task_counter:04d}"
+    def _find(self, task_id):
+        return next((task for task in self._tasks if task.id == task_id), None)
 
-    def _insert_task(self, task: TaskRecord) -> None:
-        with self._lock:
-            self._tasks.insert(0, task)
+    def detail(self, task_id):
+        task = self._find(task_id)
+        if not task: raise HTTPException(404, '任务不存在')
+        status = self.status()
+        current = status.active_task or status.last_task
+        detail = self._call('detail') if current and current['id'] == task_id else self.repository.detail(task_id)
+        return {'task': task.model_dump(), **(detail or {'samples': [], 'preview': None, 'plan': None})}
 
-    def _update_task(self, task_id: str, *, status: str, message: str,
-                     optimization=None, execution_effects=None) -> bool:
+    def task_history(self):
+        with self._lock: return list(self._tasks)
+
+    def replay(self, task_id, index):
+        if self.status().active_task:
+            raise HTTPException(409, '运行或规划期间不能回放历史任务')
+        if not self._replay_cache or self._replay_cache['task']['id'] != task_id:
+            self._replay_cache = self.detail(task_id)
+        return self._call('replay', self._replay_cache, index)
+
+    def logs(self):
+        with self._lock: return list(self._logs)
+
+    def _update_task(self, task_id, **updates):
         with self._lock:
             for index, task in enumerate(self._tasks):
                 if task.id == task_id:
-                    updates = {'status': status, 'message': message}
-                    if optimization is not None:
-                        updates['optimization'] = optimization
-                    if execution_effects is not None:
-                        updates['execution_effects'] = execution_effects
-                    if all(getattr(task, key) == value for key, value in updates.items()):
+                    if task.status in ('completed', 'failed', 'cancelled', 'interrupted') and updates.get('status') in ('planning', 'planned', 'running', 'paused'):
                         return False
-                    self._tasks[index] = task.model_copy(
-                        update=updates
-                    )
+                    updates = {key: value for key, value in updates.items() if value is not None}
+                    self._tasks[index] = task.model_copy(update=updates)
+                    self.repository.save(self._tasks[index].model_dump())
                     return True
         return False
 
-    @staticmethod
-    def _format_planning_error(exc: Exception) -> str:
-        if isinstance(exc, HTTPException):
-            return f"LLM 规划失败：{exc.detail}"
-        return f"LLM 规划失败：{exc}"
+    def _add_log(self, level, message):
+        with self._lock:
+            self._logs.insert(0, LogRecord(id=uuid4().hex[:10], timestamp=self._now(), level=level, message=message))
+            del self._logs[500:]
+
+    def _build_llm_planner(self): return create_planner(LLMSettings.from_env())
 
     @staticmethod
-    def _now() -> str:
-        return datetime.now().isoformat(timespec="seconds")
+    def _now(): return datetime.now().astimezone().isoformat(timespec='seconds')
+
+    def close(self):
+        if self.worker:
+            try:
+                self._call('stop')
+            except HTTPException:
+                pass
+            finally:
+                self.worker.close()
 
 
-def create_app(
-    *,
-    enable_simulation: bool = True,
-    settings: BackendSettings | None = None,
-    frontend_dist: Path | None = None,
-) -> FastAPI:
-    active_settings = settings or BackendSettings()
-    if frontend_dist is not None:
-        active_settings = BackendSettings(
-            scene_path=active_settings.scene_path,
-            frontend_dist=Path(frontend_dist),
-            width=active_settings.width,
-            height=active_settings.height,
-            fps=active_settings.fps,
-            jpeg_quality=active_settings.jpeg_quality,
-        )
-
-    runtime = SimulationRuntime(active_settings, enabled=enable_simulation)
+def create_app(*, enable_simulation=True, settings=None, frontend_dist=None):
+    settings = settings or BackendSettings()
+    if frontend_dist is not None: settings = replace(settings, frontend_dist=Path(frontend_dist))
+    runtime = SimulationRuntime(settings, enable_simulation)
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI):
-        try:
-            yield
-        finally:
-            runtime.close()
+    async def lifespan(_app):
+        await asyncio.to_thread(runtime.start)
+        try: yield
+        finally: await asyncio.to_thread(runtime.close)
 
-    app = FastAPI(title="STA MuJoCo Web", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title='STA Control', version='0.3.0', lifespan=lifespan)
     app.state.simulation_runtime = runtime
 
-    @app.get("/api/health", response_model=HealthResponse)
-    def health() -> HealthResponse:
-        return HealthResponse(status="ok")
+    @app.get('/api/health', response_model=HealthResponse)
+    def health(): return HealthResponse(status='ok')
 
-    @app.get("/api/simulation/status", response_model=SimulationStatus)
-    def simulation_status() -> SimulationStatus:
+    @app.get('/api/scenarios')
+    def presets(): return scenarios()
+
+    @app.get('/api/simulation/status', response_model=SimulationStatus)
+    def status(): return runtime.status()
+
+    @app.post('/api/simulation/control', response_model=SimulationStatus)
+    def control(request: ControlRequest): return runtime.control(request)
+
+    @app.post('/api/simulation/camera', response_model=SimulationStatus)
+    def camera(request: CameraRequest): return runtime.camera(request)
+
+    @app.post('/api/simulation/overlay')
+    def overlay(request: OverlayRequest):
+        runtime._call('set_overlay', **request.model_dump())
         return runtime.status()
 
-    @app.post("/api/simulation/control", response_model=SimulationStatus)
-    def simulation_control(request: ControlRequest) -> SimulationStatus:
-        return runtime.control(request)
+    @app.post('/api/tasks/dispatch', response_model=TaskRecord)
+    def dispatch(request: TaskDispatchRequest): return runtime.dispatch_task(request)
 
-    @app.post("/api/simulation/camera", response_model=SimulationStatus)
-    def simulation_camera(request: CameraRequest) -> SimulationStatus:
-        return runtime.camera(request)
+    @app.get('/api/tasks/history', response_model=list[TaskRecord])
+    def history(): return runtime.task_history()
 
-    @app.post("/api/tasks/dispatch", response_model=TaskRecord)
-    def task_dispatch(request: TaskDispatchRequest) -> TaskRecord:
-        return runtime.dispatch_task(request)
+    @app.get('/api/tasks/{task_id}/detail')
+    def detail(task_id: str): return runtime.detail(task_id)
 
-    @app.get("/api/tasks/history", response_model=list[TaskRecord])
-    def task_history() -> list[TaskRecord]:
-        return runtime.task_history()
+    @app.post('/api/tasks/{task_id}/execute')
+    def execute(task_id: str): return runtime.execute(task_id)
 
-    @app.get("/api/logs", response_model=list[LogRecord])
-    def system_logs() -> list[LogRecord]:
-        return runtime.logs()
+    @app.post('/api/tasks/{task_id}/replay')
+    def replay(task_id: str, request: ReplayRequest):
+        return runtime.replay(task_id, request.index)
 
-    @app.websocket("/ws/simulation")
-    async def simulation_websocket(websocket: WebSocket) -> None:
+    @app.get('/api/tasks/{task_id}/export')
+    def export(task_id: str):
+        content = json.dumps(runtime.detail(task_id), ensure_ascii=False)
+        return Response(content, media_type='application/json',
+                        headers={'Content-Disposition': f'attachment; filename="{task_id}.json"'})
+
+    @app.get('/api/logs', response_model=list[LogRecord])
+    def logs(): return runtime.logs()
+
+    @app.websocket('/ws/simulation')
+    async def stream(websocket: WebSocket):
         await websocket.accept()
-        if runtime.session is None:
-            await websocket.send_json({"type": "status", "payload": runtime.status().model_dump()})
+        if not runtime.worker:
+            await websocket.send_json({'type': 'status', 'payload': runtime.status().model_dump()})
             await websocket.close()
             return
-
-        send_lock = asyncio.Lock()
-
-        async def send_json(payload: dict[str, Any]) -> None:
-            async with send_lock:
-                try:
-                    await websocket.send_json(payload)
-                except RuntimeError as exc:
-                    raise WebSocketDisconnect(code=1000, reason=str(exc)) from exc
-
-        async def receive_commands() -> None:
+        lock = asyncio.Lock()
+        async def send(payload):
+            async with lock: await websocket.send_json(payload)
+        async def receive():
             while True:
                 payload = await websocket.receive_json()
-                message_type = payload.get("type")
-                if message_type == "control":
-                    status = runtime.control(ControlRequest(action=payload.get("action")))
-                elif message_type == "camera":
-                    status = runtime.camera(CameraRequest(**payload))
-                else:
-                    await send_json({"type": "error", "message": f"Unknown message type: {message_type}"})
-                    continue
-                await send_json({"type": "status", "payload": status.model_dump()})
-
-        receiver = asyncio.create_task(receive_commands())
+                try:
+                    if payload.get('type') == 'control':
+                        value = await asyncio.to_thread(runtime.control, ControlRequest(action=payload.get('action')))
+                    elif payload.get('type') == 'camera':
+                        value = await asyncio.to_thread(runtime.camera, CameraRequest(**payload))
+                    else: raise ValueError('不支持的操作')
+                    await send({'type': 'status', 'payload': value.model_dump()})
+                except Exception as exc: await send({'type': 'error', 'message': str(exc)})
+        receiver = asyncio.create_task(receive())
+        last_frame = runtime.status().frame_index
         try:
-            await send_json({"type": "status", "payload": runtime.status().model_dump()})
+            await send({'type': 'status', 'payload': runtime.status().model_dump()})
             while True:
-                frame = runtime.session.step_and_render()
-                runtime._sync_completed_tasks()
-                async with send_lock:
-                    try:
+                frame, snapshot = runtime.worker.snapshot()
+                if snapshot.get('frame_index') != last_frame:
+                    async with lock:
                         await websocket.send_bytes(frame)
-                    except RuntimeError as exc:
-                        raise WebSocketDisconnect(code=1000, reason=str(exc)) from exc
-                await send_json({"type": "status", "payload": runtime.status().model_dump()})
-                await asyncio.sleep(runtime.session.frame_interval)
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            pass
+                        await websocket.send_json({'type': 'status', 'payload': snapshot})
+                    last_frame = snapshot.get('frame_index')
+                await asyncio.sleep(.025)
+        except (WebSocketDisconnect, asyncio.CancelledError, RuntimeError): pass
         finally:
             receiver.cancel()
-            with suppress(asyncio.CancelledError, WebSocketDisconnect):
-                await receiver
+            with suppress(asyncio.CancelledError, WebSocketDisconnect): await receiver
 
-    _mount_frontend(app, active_settings.frontend_dist)
+    _mount_frontend(app, settings.frontend_dist)
     return app
 
 
-def _mount_frontend(app: FastAPI, frontend_dist: Path) -> None:
-    dist = Path(frontend_dist)
-    assets = dist / "assets"
-    if assets.is_dir():
-        app.mount("/assets", StaticFiles(directory=assets), name="frontend-assets")
-
-    index_file = dist / "index.html"
-    if not index_file.is_file():
-        return
-
-    @app.get("/")
-    def frontend_index() -> FileResponse:
-        return FileResponse(index_file)
-
-    @app.get("/{frontend_path:path}")
-    def frontend_fallback(frontend_path: str) -> FileResponse:
-        requested = (dist / frontend_path).resolve()
-        try:
-            requested.relative_to(dist.resolve())
-        except ValueError:
-            return FileResponse(index_file)
-        if requested.is_file():
-            return FileResponse(requested)
-        return FileResponse(index_file)
+def _mount_frontend(app, directory):
+    dist = Path(directory).resolve()
+    if (dist / 'assets').is_dir(): app.mount('/assets', StaticFiles(directory=dist / 'assets'), name='frontend-assets')
+    if not (dist / 'index.html').is_file(): return
+    @app.get('/')
+    @app.get('/{frontend_path:path}')
+    def frontend(frontend_path=''):
+        if frontend_path.startswith(('api/', 'ws/')):
+            raise HTTPException(404, '接口不存在')
+        path = (dist / frontend_path).resolve()
+        if path.is_relative_to(dist) and path.is_file(): return FileResponse(path)
+        return FileResponse(dist / 'index.html')

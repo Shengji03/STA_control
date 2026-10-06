@@ -35,12 +35,12 @@ def test_mujoco_stream_session_renders_jpeg_from_project_scene():
 
     assert frame[:2] == b"\xff\xd8"
     assert status["state"] == "running"
-    assert status["sim_time"] > 0
+    assert status["sim_time"] == 0
     assert status["resolution"] == [160, 90]
     assert "cam_global" in status["available_cameras"]
 
 
-def test_mujoco_stream_session_steps_physics_at_frame_interval():
+def test_idle_stream_renders_without_advancing_uncontrolled_physics():
     scene = Path("src/assets/scenes/scene5_glare.xml").resolve()
     config = SimulationConfig(scene_path=scene, width=80, height=60, fps=5)
     session = MujocoStreamSession(config)
@@ -51,7 +51,7 @@ def test_mujoco_stream_session_steps_physics_at_frame_interval():
     finally:
         session.close()
 
-    assert status["sim_time"] >= 0.1
+    assert status["sim_time"] == 0
 
 
 def test_mujoco_stream_session_accepts_camera_commands():

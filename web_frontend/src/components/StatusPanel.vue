@@ -1,71 +1,50 @@
 <script setup lang="ts">
 import { computed } from "vue";
-
 import { useSimulationStore } from "../stores/simulation";
-
+import AppIcon from "./AppIcon.vue";
 const simulation = useSimulationStore();
-
-const resolutionText = computed(() => {
-  const [width, height] = simulation.status.resolution;
-  if (!width || !height) return "--";
-  return `${width} x ${height}`;
-});
-
-const activeTaskText = computed(() => simulation.status.active_task?.id || "--");
-const activeTaskStatus = computed(() => simulation.status.active_task?.status || "--");
-const activeTaskMessage = computed(() => simulation.status.active_task?.message || "--");
-
-const activeTaskProgress = computed(() => {
-  const progress = simulation.status.active_task?.progress;
-  if (progress === undefined || progress === null) return "--";
-  return `${Math.round(progress * 100)}%`;
-});
+const latest = computed(() => simulation.status.telemetry);
 </script>
-
 <template>
-  <section class="status-panel" aria-label="仿真状态">
-    <h2>状态</h2>
-    <dl>
+  <section class="panel">
+    <div class="panel-heading">
       <div>
-        <dt>连接</dt>
-        <dd>{{ simulation.connectionState }}</dd>
+        <AppIcon name="robot" />
+        <h2>机械臂状态</h2>
       </div>
-      <div>
-        <dt>分辨率</dt>
-        <dd>{{ resolutionText }}</dd>
+      <span class="subtle-tag">双 UR5e</span>
+    </div>
+    <div class="arm-card" v-for="arm in ['L', 'R']" :key="arm">
+      <div class="arm-title">
+        <span class="arm-marker" :class="arm">{{ arm }}</span
+        ><strong>{{ arm === "L" ? "左机械臂" : "右机械臂" }}</strong
+        ><span class="subtle-tag">{{
+          latest?.arms[arm]?.skill || "待命"
+        }}</span>
       </div>
-      <div>
-        <dt>帧序号</dt>
-        <dd>{{ simulation.status.frame_index }}</dd>
+      <div class="arm-values">
+        <div>
+          <span>末端位置 / m</span
+          ><b class="mono">{{
+            latest?.arms[arm]?.actual_tcp
+              .map((v) => v.toFixed(3))
+              .join(" / ") || "—"
+          }}</b>
+        </div>
+        <div>
+          <span>跟踪偏差</span
+          ><b class="mono">{{
+            latest
+              ? (latest.arms[arm]!.tcp_error_m * 1000).toFixed(2) + " mm"
+              : "—"
+          }}</b>
+        </div>
       </div>
-      <div>
-        <dt>相机模式</dt>
-        <dd>{{ simulation.status.camera.mode || "--" }}</dd>
-      </div>
-      <div>
-        <dt>当前相机</dt>
-        <dd>{{ simulation.cameraName }}</dd>
-      </div>
-      <div>
-        <dt>当前任务</dt>
-        <dd>{{ activeTaskText }}</dd>
-      </div>
-      <div>
-        <dt>任务状态</dt>
-        <dd>{{ activeTaskStatus }}</dd>
-      </div>
-      <div>
-        <dt>任务信息</dt>
-        <dd>{{ activeTaskMessage }}</dd>
-      </div>
-      <div>
-        <dt>任务进度</dt>
-        <dd>{{ activeTaskProgress }}</dd>
-      </div>
-      <div v-if="simulation.lastError">
-        <dt>错误</dt>
-        <dd>{{ simulation.lastError }}</dd>
-      </div>
-    </dl>
+    </div>
+    <div class="task-message" role="status">
+      {{
+        simulation.task?.message || "选择示例或输入自然语言，开始一次协同作业。"
+      }}
+    </div>
   </section>
 </template>

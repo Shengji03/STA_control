@@ -1,70 +1,100 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-
+import { ref } from "vue";
 import { useSimulationStore } from "../stores/simulation";
-
+import AppIcon from "./AppIcon.vue";
 const simulation = useSimulationStore();
-const isDragging = ref(false);
-const lastPoint = ref<{ x: number; y: number } | null>(null);
-
-const connectionText = computed(() => {
-  if (simulation.connectionState === "online") return "已连接";
-  if (simulation.connectionState === "connecting") return "连接中";
-  if (simulation.connectionState === "offline") return "离线";
-  return "未连接";
-});
-
-function onPointerDown(event: PointerEvent): void {
-  isDragging.value = true;
-  lastPoint.value = { x: event.clientX, y: event.clientY };
-  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+let point: { x: number; y: number } | null = null;
+let lastSend = 0;
+const dragging = ref(false);
+function down(e: PointerEvent) {
+  point = { x: e.clientX, y: e.clientY };
+  dragging.value = true;
+  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 }
-
-function onPointerMove(event: PointerEvent): void {
-  if (!isDragging.value || !lastPoint.value) return;
-  const dx = event.clientX - lastPoint.value.x;
-  const dy = event.clientY - lastPoint.value.y;
-  lastPoint.value = { x: event.clientX, y: event.clientY };
+function move(e: PointerEvent) {
+  if (!point) return;
+  const now = performance.now();
+  if (now - lastSend < 65) return;
+  lastSend = now;
+  const dx = e.clientX - point.x,
+    dy = e.clientY - point.y;
+  point = { x: e.clientX, y: e.clientY };
   void simulation.sendCamera({ action: "orbit", dx: dx * 0.35, dy: dy * 0.25 });
 }
-
-function onPointerUp(event: PointerEvent): void {
-  isDragging.value = false;
-  lastPoint.value = null;
-  (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
+function up(e: PointerEvent) {
+  point = null;
+  dragging.value = false;
+  const el = e.currentTarget as HTMLElement;
+  if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
 }
-
-function onWheel(event: WheelEvent): void {
-  event.preventDefault();
-  void simulation.sendCamera({ action: "zoom", amount: event.deltaY * 0.003 });
+function wheel(e: WheelEvent) {
+  void simulation.sendCamera({ action: "zoom", amount: e.deltaY * 0.003 });
 }
+const labels: Record<string, string> = {
+  planned: "规划轨迹",
+  actual: "实际轨迹",
+  L: "L 臂",
+  R: "R 臂",
+};
 </script>
-
 <template>
-  <section class="viewport-shell" aria-label="MuJoCo 仿真画面">
-    <header class="viewport-header">
+  <section class="panel viewport-shell" aria-label="MuJoCo 仿真画面">
+    <div class="panel-heading">
       <div>
-        <h1>STA Control</h1>
-        <p :data-state="simulation.connectionState">{{ connectionText }}</p>
+        <AppIcon name="monitor" />
+        <h2>MuJoCo 实时仿真</h2>
       </div>
-      <div class="metrics">
-        <span class="state-pill" :data-state="simulation.status.state">{{ simulation.status.state }}</span>
-        <span><strong>{{ simulation.status.sim_time.toFixed(4) }}</strong>s</span>
-        <span><strong>{{ simulation.measuredFps || simulation.status.fps }}</strong> FPS</span>
-      </div>
-    </header>
-
+      <span
+        class="badge"
+        :data-status="simulation.isOnline ? 'completed' : 'failed'"
+        >{{ simulation.isOnline ? "LIVE" : "连接中" }}</span
+      >
+    </div>
     <div
       class="stream-surface"
-      @pointerdown="onPointerDown"
-      @pointermove="onPointerMove"
-      @pointerup="onPointerUp"
-      @pointercancel="onPointerUp"
-      @wheel="onWheel"
+      :class="{ dragging }"
+      @pointerdown="down"
+      @pointermove="move"
+      @pointerup="up"
+      @pointercancel="up"
+      @wheel.prevent="wheel"
     >
-      <img v-if="simulation.frameUrl" :src="simulation.frameUrl" alt="MuJoCo realtime render" draggable="false" />
-      <div v-else class="empty-frame">等待仿真画面</div>
+      <img
+        v-if="simulation.frameUrl"
+        :src="simulation.frameUrl"
+        alt="MuJoCo 双臂机器人仿真画面与轨迹"
+        draggable="false"
+      />
+      <div v-else class="empty-state">
+        <AppIcon name="robot" :size="44" /><strong>正在建立画面连接</strong>
+        <p>请确认仿真后端已启动</p>
+      </div>
+      <span class="viewport-label">{{
+        simulation.status.replay
+          ? "历史状态回放"
+          : simulation.status.scene === "scene4_pipeline.xml"
+            ? "管道作业场景"
+            : "化工遮光场景"
+      }}</span>
+    </div>
+    <div class="viewport-toolbar">
+      <div class="toggle-group">
+        <button
+          v-for="(label, key) in labels"
+          :key="key"
+          :class="{ selected: simulation.status.overlay?.[key] }"
+          :aria-pressed="simulation.status.overlay?.[key]"
+          @click="simulation.toggleOverlay(key)"
+        >
+          <span
+            v-if="key === 'planned' || key === 'actual'"
+            class="legend-line"
+            :class="{ dashed: key === 'planned' }"
+          ></span
+          >{{ label }}
+        </button>
+      </div>
+      <span class="muted">拖动旋转 · 滚轮缩放</span>
     </div>
   </section>
 </template>
-

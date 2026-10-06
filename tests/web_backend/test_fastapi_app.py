@@ -117,12 +117,12 @@ def test_task_dispatch_records_history_logs_and_active_simulation_task():
 
         assert response.status_code == 200
         task = response.json()
-        assert task["status"] == "running"
+        assert task["status"] == "planning"
         assert task["id"].startswith("LAB-")
 
         status = client.get("/api/simulation/status").json()
         assert status["active_task"]["id"] == task["id"]
-        assert status["active_task"]["runner_state"] == "INIT"
+        assert status["active_task"]["runner_state"] in {'IDLE', 'INIT', 'PHASE_NAV'}
 
         history = client.get("/api/tasks/history").json()
         assert history[0]["id"] == task["id"]

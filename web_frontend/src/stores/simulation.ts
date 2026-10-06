@@ -1,166 +1,245 @@
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
-
-import { fetchSimulationStatus, postCameraCommand, postSimulationControl } from "../api/http";
+import { computed, ref, shallowRef } from "vue";
+import {
+  fetchSimulationStatus,
+  postCameraCommand,
+  postSimulationControl,
+  fetchTaskDetail,
+  setOverlay,
+  errorMessage,
+} from "../api/http";
 import { createWebSocketUrl } from "../api/urls";
-import type { CameraCommand, ControlAction, ServerMessage, SimulationStatus } from "../types/simulation";
-
-const disabledStatus: SimulationStatus = {
-  state: "disabled",
-  sim_time: 0,
-  frame_index: 0,
-  resolution: [0, 0],
-  fps: 0,
-  camera: {},
-  available_cameras: [],
-  active_task: null,
-};
-
+import type {
+  CameraCommand,
+  ControlAction,
+  ServerMessage,
+  SimulationStatus,
+  Sample,
+  TaskDetail,
+} from "../types/simulation";
 export const useSimulationStore = defineStore("simulation", () => {
-  const status = ref<SimulationStatus>(disabledStatus);
-  const frameUrl = ref<string>("");
-  const connectionState = ref<"idle" | "connecting" | "online" | "offline">("idle");
-  const lastError = ref<string>("");
+  const status = ref<SimulationStatus>({
+    state: "disabled",
+    sim_time: 0,
+    frame_index: 0,
+    resolution: [0, 0],
+    fps: 20,
+    camera: {},
+    available_cameras: [],
+    active_task: null,
+  });
+  const frameUrl = ref("");
+  const connectionState = ref("idle");
+  const lastError = ref("");
   const measuredFps = ref(0);
-
-  let socket: WebSocket | null = null;
-  let reconnectTimer: number | undefined;
-  let previousFrameUrl = "";
-  let frameCount = 0;
-  let fpsWindowStart = performance.now();
-
+  const samples = shallowRef<Sample[]>([]);
+  const detail = shallowRef<TaskDetail | null>(null);
+  const task = computed(
+    () => status.value.active_task || status.value.last_task,
+  );
+  const cameraName = computed(() =>
+    status.value.camera.mode === "fixed"
+      ? status.value.camera.fixed_camera
+      : "free",
+  );
   const isOnline = computed(() => connectionState.value === "online");
-  const cameraName = computed(() => status.value.camera?.fixed_camera || "free");
-
-  async function refreshStatus(): Promise<void> {
-    status.value = await fetchSimulationStatus();
+  let socket: WebSocket | null = null,
+    reconnectTimer: number | undefined;
+  let wanted = false,
+    loadingId = "",
+    detailKey = "",
+    requestKey = "",
+    sampleTask = "",
+    oldUrl = "",
+    count = 0,
+    started = performance.now();
+  function liveWindow(rows: Sample[]) {
+    const end = rows.at(-1)?.t ?? 0;
+    return rows.filter((s) => s.t >= end - 60).slice(-1200);
   }
-
-  function connect(): void {
-    disconnect(false);
+  function accept(payload: SimulationStatus) {
+    status.value = payload;
+    if (payload.state === "error" && payload.message)
+      lastError.value = payload.message;
+    const active = payload.active_task || payload.last_task;
+    if (!active && sampleTask) {
+      sampleTask = "";
+      samples.value = [];
+      detail.value = null;
+      detailKey = "";
+    }
+    if (active && active.id !== sampleTask) {
+      sampleTask = active.id;
+      samples.value = [];
+      detail.value = null;
+      detailKey = "";
+    }
+    if (payload.replay && detail.value)
+      samples.value = liveWindow(
+        detail.value.samples.filter((s) => s.t <= payload.sim_time),
+      );
+    const sample = payload.telemetry;
+    if (sample && !payload.replay && sample.t !== samples.value.at(-1)?.t)
+      samples.value = liveWindow([...samples.value, sample]);
+    const key = active
+      ? active.id +
+        ":" +
+        (active.status === "planning"
+          ? "planning"
+          : active.status === "planned"
+            ? "planned"
+            : active.status === "completed" ||
+                active.status === "failed" ||
+                active.status === "cancelled"
+              ? "finished"
+              : "running")
+      : "";
+    if (active && key !== detailKey && loadingId !== key) {
+      loadingId = key;
+      requestKey = key;
+      void fetchTaskDetail(active.id)
+        .then((d) => {
+          if (sampleTask === active.id && requestKey === key) {
+            detail.value = d;
+            detailKey = key;
+            if (d.samples.length)
+              samples.value = liveWindow(
+                status.value.replay
+                  ? d.samples.filter((s) => s.t <= status.value.sim_time)
+                  : d.samples,
+              );
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (loadingId === key) loadingId = "";
+        });
+    }
+  }
+  async function refreshStatus() {
+    try {
+      accept(await fetchSimulationStatus());
+    } catch (e) {
+      lastError.value = errorMessage(e);
+    }
+  }
+  function connect() {
+    wanted = true;
+    if (
+      socket &&
+      (socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING)
+    )
+      return;
     connectionState.value = "connecting";
-    socket = new WebSocket(createWebSocketUrl("/ws/simulation"));
-    socket.binaryType = "blob";
-
-    socket.addEventListener("open", () => {
+    const current = new WebSocket(createWebSocketUrl("/ws/simulation"));
+    socket = current;
+    current.binaryType = "blob";
+    current.onopen = () => {
+      if (socket !== current) return;
       connectionState.value = "online";
       lastError.value = "";
-    });
-
-    socket.addEventListener("close", () => {
-      connectionState.value = "offline";
-      scheduleReconnect();
-    });
-
-    socket.addEventListener("error", () => {
-      lastError.value = "WebSocket connection error";
-      connectionState.value = "offline";
-    });
-
-    socket.addEventListener("message", (event) => {
+    };
+    current.onmessage = (event) => {
+      if (socket !== current) return;
       if (typeof event.data === "string") {
-        handleTextMessage(event.data);
+        try {
+          const data = JSON.parse(event.data) as ServerMessage;
+          if (data.type === "status") accept(data.payload);
+          else lastError.value = data.message;
+        } catch {
+          lastError.value = "收到无法解析的状态消息";
+        }
         return;
       }
-      handleFrame(event.data as Blob);
-    });
-  }
-
-  function disconnect(clearFrame = true): void {
-    if (reconnectTimer !== undefined) {
-      window.clearTimeout(reconnectTimer);
-      reconnectTimer = undefined;
-    }
-    if (socket) {
-      socket.close();
+      const next = URL.createObjectURL(event.data as Blob);
+      const previous = oldUrl;
+      oldUrl = next;
+      frameUrl.value = next;
+      if (previous) window.setTimeout(() => URL.revokeObjectURL(previous), 250);
+      count++;
+      const elapsed = performance.now() - started;
+      if (elapsed > 1000) {
+        measuredFps.value = Math.round((count * 1000) / elapsed);
+        count = 0;
+        started = performance.now();
+      }
+    };
+    current.onclose = () => {
+      if (socket !== current) return;
       socket = null;
-    }
-    if (clearFrame && previousFrameUrl) {
-      URL.revokeObjectURL(previousFrameUrl);
-      previousFrameUrl = "";
-      frameUrl.value = "";
-    }
+      connectionState.value = "offline";
+      if (wanted && reconnectTimer === undefined)
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = undefined;
+          connect();
+        }, 1500);
+    };
+    current.onerror = () => {
+      if (socket === current) lastError.value = "画面连接中断，正在尝试重连";
+    };
   }
-
-  async function sendControl(action: ControlAction): Promise<void> {
-    const message = { type: "control", action };
-    if (sendJson(message)) {
-      return;
-    }
-    status.value = await postSimulationControl(action);
-  }
-
-  async function sendCamera(command: CameraCommand): Promise<void> {
-    const payload = { ...command, type: "camera" as const };
-    if (sendJson(payload)) {
-      return;
-    }
-    status.value = await postCameraCommand(payload);
-  }
-
-  function sendJson(payload: object): boolean {
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return false;
-    }
-    socket.send(JSON.stringify(payload));
-    return true;
-  }
-
-  function handleTextMessage(raw: string): void {
-    const parsed = JSON.parse(raw) as ServerMessage;
-    if (parsed.type === "status") {
-      status.value = parsed.payload;
-      return;
-    }
-    if (parsed.type === "error") {
-      lastError.value = parsed.message;
-    }
-  }
-
-  function handleFrame(blob: Blob): void {
-    const nextUrl = URL.createObjectURL(blob);
-    if (previousFrameUrl) {
-      URL.revokeObjectURL(previousFrameUrl);
-    }
-    previousFrameUrl = nextUrl;
-    frameUrl.value = nextUrl;
-    updateMeasuredFps();
-  }
-
-  function updateMeasuredFps(): void {
-    frameCount += 1;
-    const now = performance.now();
-    const elapsed = now - fpsWindowStart;
-    if (elapsed < 1000) {
-      return;
-    }
-    measuredFps.value = Math.round((frameCount * 1000) / elapsed);
-    frameCount = 0;
-    fpsWindowStart = now;
-  }
-
-  function scheduleReconnect(): void {
+  function disconnect() {
+    wanted = false;
     if (reconnectTimer !== undefined) {
-      return;
-    }
-    reconnectTimer = window.setTimeout(() => {
+      clearTimeout(reconnectTimer);
       reconnectTimer = undefined;
-      connect();
-    }, 1200);
+    }
+    const old = socket;
+    socket = null;
+    old?.close();
+    if (oldUrl) URL.revokeObjectURL(oldUrl);
+    frameUrl.value = "";
+    oldUrl = "";
+    connectionState.value = "idle";
   }
-
+  async function sendControl(action: ControlAction) {
+    try {
+      accept(await postSimulationControl(action));
+      lastError.value = "";
+    } catch (e) {
+      lastError.value = errorMessage(e);
+    }
+  }
+  async function sendCamera(command: CameraCommand) {
+    try {
+      accept(await postCameraCommand(command));
+    } catch (e) {
+      lastError.value = errorMessage(e);
+    }
+  }
+  async function toggleOverlay(key: string) {
+    const value: Record<string, boolean> = {
+      planned: true,
+      actual: true,
+      L: true,
+      R: true,
+      ...status.value.overlay,
+    };
+    value[key] = !value[key];
+    try {
+      await setOverlay(value);
+      await refreshStatus();
+    } catch (e) {
+      lastError.value = errorMessage(e);
+    }
+  }
   return {
     status,
     frameUrl,
     connectionState,
     lastError,
     measuredFps,
-    isOnline,
+    samples,
+    detail,
+    task,
     cameraName,
+    isOnline,
     refreshStatus,
     connect,
     disconnect,
     sendControl,
     sendCamera,
+    toggleOverlay,
   };
 });

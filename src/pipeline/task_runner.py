@@ -481,6 +481,7 @@ class TaskRunner:
         self.planning_report = {}
         self.execution_report = {}
         self._effect_monitor = None
+        self.control_references = {}
         for arm in self.arms.values():
             arm.executor = None
             arm.ctx = None
@@ -591,6 +592,8 @@ class TaskRunner:
                 desired_velocity = np.zeros(DOF)
 
             ctrl = self._compute_arm_control(arm, desired, desired_velocity)
+            self.control_references[label] = {'position': desired.copy(),
+                                              'velocity': desired_velocity.copy(), 'torque': ctrl.copy()}
 
             ctrl_start = self._L_ctrl_start if label == 'L' else self._R_ctrl_start
             for i in range(DOF):
