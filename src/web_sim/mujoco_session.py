@@ -30,6 +30,8 @@ class _TaskEvent:
     task_id: str
     status: str
     message: str
+    optimization: dict = field(default_factory=dict)
+    execution_effects: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -171,23 +173,28 @@ class MujocoStreamSession:
     def create_plan_with_llm(self, instruction: str, llm_planner: Any) -> dict[str, Any]:
         with self._lock:
             self.runner.set_llm_planner(llm_planner)
-            snapshot = self.runner.perception.get_scene_snapshot()
+            snapshot = self.runner.perception.get_scene_snapshot(include_images=False)
 
-        plan_dict = llm_planner.plan(snapshot, instruction)
-        if not plan_dict.get("plan"):
-            raise ValueError("LLM 未返回可执行 plan")
+        feedback = ''
+        for attempt in range(1 + self.runner._MAX_PLAN_RETRIES):
+            plan_dict = llm_planner.plan(snapshot, instruction, extra_context=feedback)
+            try:
+                with self._lock:
+                    return self.runner.prepare_plan(plan_dict, snapshot, instruction)
+            except ValueError as exc:
+                if attempt == self.runner._MAX_PLAN_RETRIES:
+                    raise
+                feedback = f'上一次完整分工与辅助安排校验失败: {exc}。请修正 goals/stages 和导航位置。'
 
-        with self._lock:
-            self.runner.plan_executor.parse(plan_dict, self.runner._get_cart_state()[:2])
-        return plan_dict
-
-    def consume_task_events(self) -> list[dict[str, str]]:
+    def consume_task_events(self) -> list[dict[str, Any]]:
         with self._lock:
             events = [
                 {
                     "task_id": event.task_id,
                     "status": event.status,
                     "message": event.message,
+                    "optimization": event.optimization,
+                    "execution_effects": event.execution_effects,
                 }
                 for event in self._task_events
             ]
@@ -250,6 +257,8 @@ class MujocoStreamSession:
                 self._finish_active_task_locked("completed", "任务执行完成")
             elif self.runner.state == "TIMEOUT":
                 self._finish_active_task_locked("failed", "任务执行超时")
+            elif self.runner.state == 'FAILED':
+                self._finish_active_task_locked('failed', '阀门角度或必需遮光效果未通过传感器校验')
             else:
                 self._finish_active_task_locked("failed", f"任务停止：{self.runner.state}")
 
@@ -263,6 +272,8 @@ class MujocoStreamSession:
                 task_id=self._active_task.task_id,
                 status=status,
                 message=message,
+                optimization=self.runner.planning_report,
+                execution_effects=self.runner.execution_report,
             )
         )
         self._active_task = None
@@ -310,6 +321,8 @@ class MujocoStreamSession:
             "runner_state": self.runner.state,
             "phase_index": phase_index,
             "phase_count": phase_count,
+            "optimization": self.runner.planning_report,
+            "execution_effects": self.runner.execution_report,
         }
 
     def _collect_camera_names(self) -> list[str]:

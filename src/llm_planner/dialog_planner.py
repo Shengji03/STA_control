@@ -125,11 +125,11 @@ class DialogPlanner:
             plan_dict = self._extract_plan_json(final_response)
             last_plan = plan_dict
 
-            if not plan_dict.get("plan"):
+            if not plan_dict.get("plan") and not plan_dict.get("stages"):
                 feedback_history.append(
                     "上一次响应里未能提取到有效 JSON plan, "
                     "请确认 EXECUTE 后立刻输出可被 json.loads 解析的 JSON 对象, "
-                    "字段必须包含 reasoning 和 plan 数组。"
+                    "字段必须包含 reasoning、goals 和 stages 数组。"
                 )
                 continue
 
@@ -251,6 +251,11 @@ class DialogPlanner:
             "max_completion_tokens": self.max_completion_tokens,
         }
 
+        # The current planner uses synchronous text and JSON responses, without
+        # preserving reasoning_content across dialogue turns.
+        if self.model.lower().startswith("qwen3"):
+            api_kwargs["extra_body"] = {"enable_thinking": False}
+
         # GPT-5.x: structured output
         if self.model.startswith("gpt-5") and force_json:
             api_kwargs["response_format"] = {
@@ -367,7 +372,7 @@ class DialogPlanner:
             joined = "\n".join(agent_responses)
             self._chat_history.append(
                 f"[Chat]\n{joined}\n[Executed Plan]\n"
-                f"{json.dumps(plan_dict.get('plan', []), ensure_ascii=False)}"
+                f"{json.dumps(plan_dict, ensure_ascii=False)}"
             )
 
     def _record_usage(
@@ -396,6 +401,9 @@ class DialogPlanner:
         print("  DialogPlanner 协商结果")
         print("=" * 60)
         print(f"  推理: {result.get('reasoning', '')}\n")
+        for goal in result.get('goals', []):
+            print(f"  目标 {goal['id']}: {goal['object']} {goal['operation']}, "
+                  f"shade={goal.get('shade', 'none')}, 建议臂={goal.get('preferred_arm')}")
         for step in result.get("plan", []):
             arm = step.get("arm", "?")
             skill = step.get("skill", "?")

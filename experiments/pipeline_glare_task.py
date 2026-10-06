@@ -585,7 +585,12 @@ class GlareShieldTask:
     # ------------------------------------------------------------------
 
     def _apply_arm_control(self, arm, ctrl_start, sensor_data, real_vel, desired):
-        ctrl = arm.compute_control(desired, sensor_data, real_vel, self.model.opt.timestep)
+        active = (self.phase in (PHASE_VALVE, PHASE_L_RETURN) if arm.label == 'L'
+                  else self.phase in (PHASE_SHADE, PHASE_UNSHADE))
+        velocity = (arm.executor.get_desired_velocity(arm.ctx)
+                    if active and arm.executor and not arm.executor.is_all_complete else np.zeros(self.dof))
+        ctrl = arm.compute_control(desired, sensor_data, real_vel, self.model.opt.timestep,
+                                   desired_velocity=velocity)
         for i in range(self.dof):
             self.data.ctrl[ctrl_start + i] = ctrl[i]
         self.data.ctrl[arm._gripper_ctrl] = arm.ctx.gripper_target

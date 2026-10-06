@@ -143,7 +143,9 @@ class SimulationRuntime:
             return
         for event in self.session.consume_task_events():
             task_id = event["task_id"]
-            changed = self._update_task(task_id, status=event["status"], message=event["message"])
+            changed = self._update_task(task_id, status=event["status"], message=event["message"],
+                                        optimization=event.get('optimization'),
+                                        execution_effects=event.get('execution_effects'))
             if changed:
                 level = "INFO" if event["status"] == "completed" else "ERROR"
                 self._add_log(level, f"任务 {task_id} {event['message']}")
@@ -165,7 +167,8 @@ class SimulationRuntime:
             llm_planner = self._build_llm_planner()
             plan_dict = self.session.create_plan_with_llm(instruction, llm_planner)
             self.session.activate_planned_task(task_id, plan_dict)
-            self._update_task(task_id, status="running", message="LLM 规划完成，任务执行中")
+            self._update_task(task_id, status="running", message="LLM 与次模分工规划完成，任务执行中",
+                              optimization=plan_dict.get('optimization'))
             self._add_log("INFO", f"任务 {task_id} LLM 规划完成，已进入 TaskRunner 执行队列")
         except Exception as exc:
             message = self._format_planning_error(exc)
@@ -205,14 +208,20 @@ class SimulationRuntime:
         with self._lock:
             self._tasks.insert(0, task)
 
-    def _update_task(self, task_id: str, *, status: str, message: str) -> bool:
+    def _update_task(self, task_id: str, *, status: str, message: str,
+                     optimization=None, execution_effects=None) -> bool:
         with self._lock:
             for index, task in enumerate(self._tasks):
                 if task.id == task_id:
-                    if task.status == status and task.message == message:
+                    updates = {'status': status, 'message': message}
+                    if optimization is not None:
+                        updates['optimization'] = optimization
+                    if execution_effects is not None:
+                        updates['execution_effects'] = execution_effects
+                    if all(getattr(task, key) == value for key, value in updates.items()):
                         return False
                     self._tasks[index] = task.model_copy(
-                        update={"status": status, "message": message}
+                        update=updates
                     )
                     return True
         return False

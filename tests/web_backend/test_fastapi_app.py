@@ -131,7 +131,8 @@ def test_task_dispatch_records_history_logs_and_active_simulation_task():
         assert any(task["id"] in entry["message"] for entry in logs)
 
 
-def test_task_dispatch_without_plan_uses_async_llm_planning(monkeypatch):
+def test_task_dispatch_without_plan_uses_async_llm_planning(monkeypatch, tmp_path):
+    monkeypatch.setenv("STA_ENV_FILE", str(tmp_path / "missing.env"))
     monkeypatch.delenv("STA_LLM_API_KEY", raising=False)
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
@@ -176,6 +177,33 @@ def test_task_dispatch_without_plan_uses_async_llm_planning(monkeypatch):
         logs = client.get("/api/logs").json()
         assert any("LLM 规划队列" in entry["message"] for entry in logs)
         assert any("LLM 规划失败" in entry["message"] for entry in logs)
+
+
+def test_semantic_task_history_exposes_optimization_report_without_api_calls(monkeypatch):
+    from math import pi
+    from src.web_backend.app import SimulationRuntime
+
+    class Planner:
+        def plan(self, snapshot, instruction, extra_context=''):
+            return {'goals': [{'id': 'v', 'object': 'valve_1', 'operation': 'rotate',
+                               'angle': pi, 'preferred_arm': 'R'}],
+                    'stages': [{'nav': {'target': [.45, 0]}, 'goals': ['v']}]}
+
+    monkeypatch.setattr(SimulationRuntime, '_build_llm_planner', lambda _self: Planner())
+    settings = BackendSettings(scene_path=DEFAULT_SCENE_PATH, width=80, height=60, fps=5)
+    with TestClient(create_app(settings=settings)) as client:
+        dispatched = client.post('/api/tasks/dispatch', json={'instruction': '旋拧1号阀门180度'}).json()
+        deadline = time.monotonic() + 3
+        history = None
+        while time.monotonic() < deadline:
+            history = client.get('/api/tasks/history').json()[0]
+            if history['status'] != 'planning':
+                break
+            time.sleep(.01)
+        assert history['id'] == dispatched['id']
+        assert history['status'] == 'running'
+        assert history['optimization']['assignments'][0]['arm'] == 'L'
+        assert history['optimization']['covered_goal_count'] == 1
 
 
 def test_task_dispatch_reports_disabled_simulation_session():

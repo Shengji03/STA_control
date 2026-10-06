@@ -17,3 +17,8 @@ class JointTrajectory:
         progress = float(np.clip(time / self.duration, 0.0, 1.0))
         progress = 3.0 * progress ** 2 - 2.0 * progress ** 3
         return self.start + progress * (self.target - self.start)
+
+    def velocity(self, time: float) -> np.ndarray:
+        progress = float(np.clip(time / self.duration, 0.0, 1.0))
+        rate = 6.0 * progress * (1.0 - progress) / self.duration
+        return rate * (self.target - self.start)

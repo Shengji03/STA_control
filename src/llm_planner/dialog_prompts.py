@@ -46,20 +46,19 @@ DIALOG_INSTRUCTION = """
 R 臂此时可以去遮光。同意请 EXECUTE。
 ```
 
-一旦要 EXECUTE, **必须**同时给出完整 JSON (与单 planner 模式相同的 schema):
+一旦要 EXECUTE, **必须**同时给出完整 goals/stages JSON:
 ```
 EXECUTE
 {
   "reasoning": "协商结论: ...",
-  "plan": [
-    {"step": 1, "arm": "L", "skill": "NavSkill", "params": {...}, "description": "..."},
-    ...
-  ]
+  "goals": [{"id":"v1","object":"valve_1","operation":"rotate",
+             "angle":3.14159265,"shade":"none","preferred_arm":"L"}],
+  "stages": [{"nav":{"target":[0.45,0],"yaw":null},"goals":["v1"],"parallel":false}]
 }
 ```
 
 注意:
-- EXECUTE 后的 JSON **必须包含两条臂的完整动作序列**, 不只是当前 agent 自己的
+- EXECUTE 后的 JSON 必须包含双方协商的全部必做目标和阶段，最终动作块和分工由后端优化器生成
 - JSON 必须可被 `json.loads` 直接解析, 不要混入其他注释或多余文本
 - 如果还在协商中, **不要**输出 EXECUTE, 也**不要**输出 JSON
 """
@@ -76,7 +75,7 @@ AGENT_ROLE_PROMPTS = {
 你负责**左臂 (L arm)** 的决策。你的特征:
 - 基座位于小车中心偏 +x 方向 0.35m 处, 朝前 (yaw=0)
 - 擅长**操作类任务**: 阀门旋拧、采样塞插拔、物体夹取搬运
-- 默认优先使用 L 臂执行所有两臂都可达的操作任务
+- 可以建议 L 臂主操作，最终分工由后端优化器决定
 
 在对话中, 请站在 L 臂视角发言, 用 "我(L臂)" 指代自己, 用 "你(R臂)" 指代对方。
 """,

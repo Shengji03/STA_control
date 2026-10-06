@@ -5,5 +5,6 @@ roboticstoolbox-python>=1.1,<2
 spatialmath-python>=1.1,<2
 Pillow>=10
 openai>=1
+python-dotenv>=1.2,<2
 matplotlib>=3.8
 scipy>=1.11

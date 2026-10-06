@@ -28,7 +28,7 @@ class PlanExecutor:
         'TranslateSkill': (TranslateSkill, SkillType.TRANSLATE),
     }
 
-    def __init__(self, arm_offsets: Dict[str, np.ndarray], arm_yaws: Dict[str, float]):
+    def __init__(self, arm_offsets: Dict[str, np.ndarray], arm_yaws: Dict[str, float], verbose=True):
         """
         Args:
             arm_offsets: {'L': [x,y,z], 'R': [x,y,z]} - arm positions relative to cart
@@ -36,6 +36,7 @@ class PlanExecutor:
         """
         self.arm_offsets = arm_offsets
         self.arm_yaws = arm_yaws
+        self.verbose = verbose
 
         # Maintain separate UR5e instances for IK solving
         self._robots = {
@@ -49,7 +50,7 @@ class PlanExecutor:
             robot.set_joint(init_q)
             robot.setRobotConfig(init_q)
 
-    def parse(self, llm_result: dict, cart_pos: np.ndarray) -> dict:
+    def parse(self, llm_result: dict, cart_pos: np.ndarray, cart_yaw: float = 0.0) -> dict:
         """
         Parse LLM plan result into phased skill lists.
 
@@ -64,6 +65,41 @@ class PlanExecutor:
                 ]
             }
         """
+        # Every parse starts from the same IK seed: candidate evaluation must not
+        # depend on the order in which other candidates were considered.
+        for robot in self._robots.values():
+            robot.set_joint(list(INITIAL_JOINTS))
+            robot.setRobotConfig(list(INITIAL_JOINTS))
+        if 'execution_phases' in llm_result:
+            phases = []
+            effective_pos = np.asarray(cart_pos, dtype=float)
+            effective_yaw = float(cart_yaw)
+            for raw in llm_result['execution_phases']:
+                nav = raw.get('nav')
+                if nav:
+                    effective_pos = np.asarray(nav['target'], dtype=float)
+                    if nav.get('yaw') is not None:
+                        effective_yaw = float(nav['yaw'])
+                phase = {'nav': nav, 'L': [], 'R': [], 'R_cleanup': [],
+                         'mode': raw.get('mode'), 'goal_ids': raw.get('goal_ids', []),
+                         'contact_targets': raw.get('contact_targets', {})}
+                for step in raw.get('steps', []):
+                    arm = step.get('arm')
+                    if arm not in ('L', 'R'):
+                        raise ValueError('arm 必须为 L/R')
+                    skill = self._parse_step(step, effective_pos, effective_yaw)
+                    skill.goal_id = step.get('goal_id')
+                    phase[arm].append(skill)
+                for step in raw.get('cleanup_R', []):
+                    if step.get('arm') != 'R':
+                        raise ValueError('cleanup_R 必须由 R 臂执行')
+                    phase['R_cleanup'].append(self._parse_step(step, effective_pos, effective_yaw))
+                self._validate_mode(phase)
+                phases.append(phase)
+            if not phases:
+                raise ValueError('执行阶段不能为空')
+            return {'phases': phases}
+
         plan_steps = llm_result.get('plan', [])
 
         phases = []
@@ -86,28 +122,51 @@ class PlanExecutor:
                         'L': [], 'R': [],
                     }
                     effective_cart_pos = np.array(target[:2], dtype=float)
-                    print(f"[PlanExecutor] Phase {len(phases)}: NavSkill -> "
+                    if yaw is not None:
+                        cart_yaw = float(yaw)
+                    self._log(f"[PlanExecutor] Phase {len(phases)}: NavSkill -> "
                           f"小车将移动到 {target}")
                 continue
 
             try:
-                skill = self._parse_step(step, effective_cart_pos)
+                if arm not in ('L', 'R'):
+                    raise ValueError('arm 必须为 L/R')
+                skill = self._parse_step(step, effective_cart_pos, cart_yaw)
                 if skill:
                     if arm == 'L':
                         current_phase['L'].append(skill)
                     elif arm == 'R':
                         current_phase['R'].append(skill)
             except Exception as e:
-                print(f"[PlanExecutor] Error parsing step {step.get('step')}: {e}")
+                self._log(f"[PlanExecutor] Error parsing step {step.get('step')}: {e}")
                 raise
 
         if current_phase['L'] or current_phase['R'] or current_phase['nav']:
             phases.append(current_phase)
 
-        print(f"[PlanExecutor] 共 {len(phases)} 个执行阶段")
+        for phase in phases:
+            # Legacy plans can explicitly mark shade setup. Ordinary R-arm
+            # grasping is a main task and does not imply assistance.
+            phase['mode'] = ('parallel' if phase['L'] and phase['R'] else
+                             'single_L' if phase['L'] else 'single_R' if phase['R'] else 'idle')
+            self._validate_mode(phase)
+
+        self._log(f"[PlanExecutor] 共 {len(phases)} 个执行阶段")
         return {'phases': phases}
 
-    def _parse_step(self, step: dict, cart_pos: np.ndarray) -> Optional[BaseSkill]:
+    @staticmethod
+    def _validate_mode(phase):
+        mode = phase.get('mode')
+        has_l, has_r = bool(phase['L']), bool(phase['R'])
+        valid = {'idle': not has_l and not has_r,
+                 'single_L': has_l and not has_r, 'single_R': has_r and not has_l,
+                 'parallel': has_l and has_r, 'assist_R_then_L': has_l and has_r}
+        if not valid.get(mode, False):
+            raise ValueError(f'执行模式 {mode} 与机械臂动作不匹配')
+        if mode == 'assist_R_then_L' and not phase.get('R_cleanup'):
+            raise ValueError('遮光辅助必须包含显式 R_cleanup')
+
+    def _parse_step(self, step: dict, cart_pos: np.ndarray, cart_yaw: float = 0.0) -> Optional[BaseSkill]:
         """Convert a single plan step dict to a Skill instance."""
         skill_name = step.get('skill', '')
         params = step.get('params', {})
@@ -156,19 +215,16 @@ class PlanExecutor:
                 orientation = SO3.Rx(np.pi + tilt) * SO3.Ry(tilt_y)
             else:
                 orientation = params.get('orientation', None)
+                if orientation is not None and not isinstance(orientation, SO3):
+                    orientation = SO3(np.asarray(orientation, dtype=float))
 
             # Resolve joint angles via IK
             target_joints = self._resolve_target_joints(
-                arm, target_pos, cart_pos, orientation
+                arm, target_pos, cart_pos, orientation, cart_yaw=cart_yaw
             )
 
             if target_joints is None:
-                arm_offset = self.arm_offsets[arm]
-                arm_world = np.array([
-                    cart_pos[0] + arm_offset[0],
-                    cart_pos[1] + arm_offset[1],
-                    arm_offset[2]
-                ])
+                arm_world, _ = self.arm_pose(arm, cart_pos, cart_yaw)
                 raise ValueError(
                     f"IK 求解失败: {skill_name} 目标 {target_pos}, "
                     f"{arm}臂基座 {arm_world.round(3).tolist()}。"
@@ -176,6 +232,8 @@ class PlanExecutor:
                     f"请调整 target_pos, 使其在臂的可达工作空间内 (建议 z < 0.9m)。"
                 )
 
+            self._robots[arm].set_joint(target_joints)
+            self._robots[arm].setRobotConfig(target_joints)
             return skill_class(
                 target_joints=target_joints,
                 duration=duration,
@@ -190,7 +248,8 @@ class PlanExecutor:
         target_pos: list,
         cart_pos: np.ndarray,
         orientation: Optional[SO3] = None,
-        tool_offset: float = MOBILE_ROBOT.tool_offset
+        tool_offset: float = MOBILE_ROBOT.tool_offset,
+        cart_yaw: float = 0.0,
     ) -> Optional[np.ndarray]:
         """
         Convert world Cartesian [x,y,z] to joint angles [6 floats].
@@ -205,12 +264,7 @@ class PlanExecutor:
         Returns:
             np.ndarray of 6 joint angles, or None if IK fails
         """
-        arm_offset = self.arm_offsets[arm]
-        arm_world = np.array([
-            cart_pos[0] + arm_offset[0],
-            cart_pos[1] + arm_offset[1],
-            arm_offset[2]
-        ])
+        arm_world, arm_yaw = self.arm_pose(arm, cart_pos, cart_yaw)
 
         target_world = np.array(target_pos)
         dist = np.linalg.norm(target_world - arm_world)
@@ -222,13 +276,12 @@ class PlanExecutor:
                 f"需要先使用 NavSkill 将小车移动到目标附近。"
             )
 
-        local_pos = self._world_to_arm_local(target_world, arm_world, self.arm_yaws[arm])
-        local_pos[2] += tool_offset
-
         if orientation is None:
             orientation = SO3.Rx(np.pi)
-
-        T_target = SE3.Rt(orientation.R, local_pos)
+        local_orientation = SO3.Rz(-arm_yaw) * orientation
+        local_pos = self._world_to_arm_local(target_world, arm_world, arm_yaw)
+        local_pos -= local_orientation.R[:, 2] * tool_offset
+        T_target = SE3.Rt(local_orientation.R, local_pos)
 
         robot = self._robots[arm]
 
@@ -243,7 +296,7 @@ class PlanExecutor:
             robot.robot_config.inline,
             robot.robot_config.wrist,
         )
-        print(f"  [IK] {arm}臂默认构型失败, 尝试其他构型 "
+        self._log(f"  [IK] {arm}臂默认构型失败, 尝试其他构型 "
               f"(local_target={local_pos.round(4).tolist()}, dist={dist:.3f}m)")
 
         for overhead in (0, 1):
@@ -256,7 +309,7 @@ class PlanExecutor:
                     robot.robot_config.wrist = wrist
                     q = robot.ikine(T_target)
                     if len(q) > 0:
-                        print(f"  [IK] 构型 (o={overhead},i={inline},w={wrist}) 成功")
+                        self._log(f"  [IK] 构型 (o={overhead},i={inline},w={wrist}) 成功")
                         return np.array(q)
 
         # 恢复原始构型
@@ -265,6 +318,15 @@ class PlanExecutor:
         robot.robot_config.wrist = orig_cfg[2]
 
         return None
+
+    def arm_pose(self, arm, cart_pos, cart_yaw=0.0):
+        rotation = SO3.Rz(cart_yaw).R
+        world = np.array([cart_pos[0], cart_pos[1], 0.0]) + rotation @ self.arm_offsets[arm]
+        return world, cart_yaw + self.arm_yaws[arm]
+
+    def _log(self, message):
+        if self.verbose:
+            print(message)
 
     def _world_to_arm_local(
         self,

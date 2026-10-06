@@ -52,6 +52,8 @@ class TaskRecord(BaseModel):
     status: str
     created_at: str
     message: str = ""
+    optimization: dict[str, Any] | None = None
+    execution_effects: dict[str, Any] | None = None
 
 
 class LogRecord(BaseModel):

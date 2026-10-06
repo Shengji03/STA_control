@@ -19,6 +19,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--time", type=float, default=300.0, help="仿真时长（秒）")
     parser.add_argument("--no-viewer", action="store_true", help="无界面运行")
     parser.add_argument("--no-trajectory", action="store_true", help="关闭轨迹绘图")
+    parser.add_argument('--plan-only', action='store_true', help='完成 LLM、分工优化和校验，打印结果，不运行仿真')
+    parser.add_argument('--report', type=Path, help='保存优化计划与实际执行效果 JSON')
+    parser.add_argument('--aux-budget', type=int, default=None, help='最多部署几次辅助；0 表示禁用辅助')
     return parser.parse_args(argv)
 
 
@@ -52,11 +55,26 @@ def main(argv=None) -> int:
         scene_path=str(args.scene.resolve()), llm_planner=planner,
         task_instruction=args.task, plan_dict=plan,
     )
-    runner.run(
-        total_time=args.time, use_viewer=not args.no_viewer,
-        show_trajectory=not args.no_trajectory,
-    )
-    return 0
+    if planner is not None:
+        print(f"[LLM] model={settings.model_name}, base_url={settings.base_url}")
+    if args.aux_budget is not None:
+        from dataclasses import replace
+        runner.planning_service.config = replace(runner.planning_service.config, max_auxiliaries=args.aux_budget)
+    if args.plan_only:
+        runner._do_planning()
+        print(json.dumps(runner.prepared_plan, ensure_ascii=False, indent=2))
+    else:
+        runner.run(
+            total_time=args.time, use_viewer=not args.no_viewer,
+            show_trajectory=not args.no_trajectory,
+        )
+    if args.report is not None:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        report = {'plan': runner.prepared_plan, 'optimization': runner.planning_report,
+                  'execution_effects': runner.execution_report, 'state': runner.state}
+        args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+        print(f'规划与执行报告: {args.report.resolve()}')
+    return 1 if getattr(runner, 'state', None) in ('FAILED', 'TIMEOUT') else 0
 
 
 if __name__ == "__main__":

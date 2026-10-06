@@ -57,6 +57,9 @@ class TrajectorySkill(BaseSkill):
         ctx.robot.move_joint(joint_pos)
         return joint_pos
 
+    def get_desired_velocity(self, ctx):
+        return self._planner.velocity(ctx.elapsed)
+
 
 class AdmittanceTrajectorySkill(TrajectorySkill):
     """
@@ -74,9 +77,15 @@ class AdmittanceTrajectorySkill(TrajectorySkill):
         super().__init__(skill_type, target_joints, duration,
                          sta_params, name)
         self._admittance = None
+        self._last_dq = None
+        self._last_compensation_time = None
+        self._compensation_velocity = None
 
     def setup(self, ctx):
         super().setup(ctx)
+        self._last_dq = np.zeros(ctx.dof)
+        self._last_compensation_time = ctx.current_time
+        self._compensation_velocity = np.zeros(ctx.dof)
         if self.admittance_mode is not None:
             ts = ctx.model.opt.timestep
             self._admittance = AdmittanceController(
@@ -90,15 +99,25 @@ class AdmittanceTrajectorySkill(TrajectorySkill):
         q_trajectory = np.array(self._planner.interpolate(t))
         ctx.robot.move_joint(q_trajectory)
 
-        if self._admittance is not None and ctx.flange_body_id >= 0:
-            f_ext = ctx.get_external_force()
-            jac = ctx.get_jacobian()
-            dq = self._admittance.compute(f_ext, jac, ctx.dof)
+        if self._admittance is not None:
+            dt = ctx.current_time - self._last_compensation_time
+            if dt > 0:
+                f_ext = ctx.get_external_force()
+                jac = ctx.get_jacobian()
+                dq = self._admittance.compute(f_ext, jac, ctx.dof)
+                self._compensation_velocity = (dq - self._last_dq) / dt
+                self._last_dq = dq.copy()
+                self._last_compensation_time = ctx.current_time
+            else:
+                dq = self._last_dq
             q_cmd = q_trajectory + dq
         else:
             q_cmd = q_trajectory
 
         return q_cmd
+
+    def get_desired_velocity(self, ctx):
+        return super().get_desired_velocity(ctx) + self._compensation_velocity
 
 
 # ============================================================================
@@ -175,7 +194,10 @@ class GraspSkill(BaseSkill):
         print(f"  [{self.name}] action={self.action}, wait={self.wait_time}s")
 
     def is_complete(self, ctx):
-        return ctx.elapsed >= self.wait_time
+        complete = ctx.elapsed >= self.wait_time
+        if complete:
+            ctx.gripper_target = self._gripper_end
+        return complete
 
     def get_desired_position(self, ctx):
         alpha = min(ctx.elapsed / self.wait_time, 1.0)

@@ -275,15 +275,14 @@ class PerceptionModule:
             start, end = cart_cfg
             cart_raw = self.data.sensordata[start:end].copy()
             cx, cy = float(cart_raw[0]), float(cart_raw[1])
-            cz = float(cart_raw[2]) if len(cart_raw) > 2 else 0.0
-            arm_L_base = [round(cx + self._ARM_L_OFFSET[0], 4),
-                          round(cy + self._ARM_L_OFFSET[1], 4),
-                          round(self._ARM_L_OFFSET[2], 4)]
-            arm_R_base = [round(cx + self._ARM_R_OFFSET[0], 4),
-                          round(cy + self._ARM_R_OFFSET[1], 4),
-                          round(self._ARM_R_OFFSET[2], 4)]
+            yaw = float(cart_raw[2]) if len(cart_raw) > 2 else 0.0
+            rotation = np.array([[np.cos(yaw), -np.sin(yaw), 0],
+                                 [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+            arm_L_base = (np.array([cx, cy, 0]) + rotation @ self._ARM_L_OFFSET).round(4).tolist()
+            arm_R_base = (np.array([cx, cy, 0]) + rotation @ self._ARM_R_OFFSET).round(4).tolist()
             planner_state["cart"] = {
-                "position": [round(cx, 4), round(cy, 4), round(cz, 4)],
+                "position": [round(cx, 4), round(cy, 4), 0.0],
+                "yaw": round(yaw, 6),
                 "arm_L_base": arm_L_base,
                 "arm_R_base": arm_R_base,
                 "arm_reach_m": self._ARM_REACH,
@@ -327,6 +326,8 @@ class PerceptionModule:
                 summary["position"] = pose["pos"]
             if pose.get("quat") is not None:
                 summary["orientation"] = pose["quat"]
+            if obj_state.get('light', {}).get('pos') is not None:
+                summary['position'] = obj_state['light']['pos']
 
             joint_state = obj_state.get("joint")
             if joint_state and joint_state.get("position") is not None:
@@ -399,7 +400,7 @@ class PerceptionModule:
     # 打包输出
     # ------------------------------------------------------------------
 
-    def get_scene_snapshot(self, include_depth: bool = False) -> Dict:
+    def get_scene_snapshot(self, include_depth: bool = False, include_images: bool = True) -> Dict:
         """获取完整场景快照: RGB 图像 (base64) + 结构化状态
 
         Args:
@@ -423,7 +424,7 @@ class PerceptionModule:
             "planner_state": self._build_planner_state(world_state),
         }
 
-        for cam in self.camera_names:
+        for cam in self.camera_names if include_images else []:
             rgb = self.render_camera(cam)
             b64 = self.image_to_base64(rgb)
             snapshot["images"][cam] = f"data:image/png;base64,{b64}"

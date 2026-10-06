@@ -25,7 +25,30 @@ class SkillContext:
         self.gripper_target = 0.0
         self.current_time = 0.0
         self.skill_start_time = 0.0
-        self.flange_body_id = -1
+        # Sensor-buffer offsets are not generalized velocity DOF addresses.
+        # Resolve each scalar joint-position sensor to its actual model joint.
+        sensors = []
+        for address in range(sensor_offset, sensor_offset + dof):
+            matches = np.flatnonzero(
+                (model.sensor_adr == address)
+                & (model.sensor_dim == 1)
+                & (model.sensor_type == mujoco.mjtSensor.mjSENS_JOINTPOS)
+                & (model.sensor_objtype == mujoco.mjtObj.mjOBJ_JOINT)
+            )
+            if len(matches) != 1:
+                raise ValueError(f'关节传感器地址 {address} 不能唯一关联到单自由度关节')
+            sensors.append(int(matches[0]))
+        self.joint_ids = np.asarray(model.sensor_objid[sensors], dtype=int)
+        if len(set(self.joint_ids)) != dof:
+            raise ValueError('机械臂关节传感器不能重复指向同一关节')
+        self.joint_dof_indices = np.asarray(model.jnt_dofadr[self.joint_ids], dtype=int)
+        self.joint_qpos_indices = np.asarray(model.jnt_qposadr[self.joint_ids], dtype=int)
+        first_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, int(self.joint_ids[0])) or ''
+        suffix = '_R' if first_name.endswith('_R') else ''
+        self.flange_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'flange' + suffix)
+        self.control_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'pinch' + suffix)
+        self._wrench_body_id = None
+        self._wrench_body_ids = np.array([], dtype=int)
 
     @property
     def elapsed(self):
@@ -38,22 +61,56 @@ class SkillContext:
         return self.data.sensordata[s:s + self.dof].copy()
 
     def get_external_force(self) -> np.ndarray:
-        """获取末端法兰处的6维外力 [fx, fy, fz, tx, ty, tz] (世界坐标系)"""
+        """Net external wrench on flange + gripper at the control point.
+
+        Returns world-axis [force (N), torque (N.m)], exerted ON the tool.
+        cfrc_ext contains only directly applied/contact forces on each body;
+        it is torque:force ordered and referenced to the kinematic root CoM.
+        Sum descendants to include finger contacts (internal contacts cancel),
+        then translate the moment to the same point used by the Jacobian.
+        """
         if self.flange_body_id < 0:
-            return np.zeros(6)
-        return self.data.cfrc_ext[self.flange_body_id].copy()
+            raise ValueError('力反馈缺少法兰刚体')
+        if self._wrench_body_id != self.flange_body_id:
+            bodies = []
+            for body in range(1, self.model.nbody):
+                ancestor = body
+                while ancestor > 0:
+                    if ancestor == self.flange_body_id:
+                        bodies.append(body)
+                        break
+                    ancestor = int(self.model.body_parentid[ancestor])
+            self._wrench_body_ids = np.asarray(bodies, dtype=int)
+            self._wrench_body_id = self.flange_body_id
+        # These scenes have no acceleration/force sensors that trigger RNE.
+        mujoco.mj_rnePostConstraint(self.model, self.data)
+        wrench = np.sum(self.data.cfrc_ext[self._wrench_body_ids], axis=0)
+        force = wrench[3:]
+        root = int(self.model.body_rootid[self.flange_body_id])
+        torque = wrench[:3] + np.cross(self.data.subtree_com[root] - self.control_point, force)
+        return np.concatenate([force, torque])
+
+    @property
+    def control_point(self):
+        """Gripper pinch point; historical 'tcp' sites are at the flange."""
+        if self.control_site_id >= 0:
+            return self.data.site_xpos[self.control_site_id].copy()
+        if self.flange_body_id >= 0:
+            return self.data.xpos[self.flange_body_id].copy()
+        raise ValueError('缺少控制参考点')
 
     def get_jacobian(self) -> np.ndarray:
-        """计算末端TCP处的6xN雅可比矩阵 (世界坐标系)"""
+        """World-axis [linear; angular] Jacobian at the wrench reference point."""
         if self.flange_body_id < 0:
-            return np.zeros((6, self.dof))
+            raise ValueError('雅可比计算缺少法兰刚体')
         jacp = np.zeros((3, self.model.nv))
         jacr = np.zeros((3, self.model.nv))
-        mujoco.mj_jacBody(self.model, self.data, jacp, jacr,
-                          self.flange_body_id)
-        s = self.sensor_offset
-        jac = np.vstack([jacp[:, s:s + self.dof],
-                         jacr[:, s:s + self.dof]])
+        if self.control_site_id >= 0:
+            mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.control_site_id)
+        else:
+            mujoco.mj_jacBody(self.model, self.data, jacp, jacr, self.flange_body_id)
+        jac = np.vstack([jacp[:, self.joint_dof_indices],
+                         jacr[:, self.joint_dof_indices]])
         return jac
 
 
@@ -169,6 +226,10 @@ class SkillExecutor:
         if skill is None:
             return np.array(ctx.robot.get_joint())
         return skill.get_desired_position(ctx)
+
+    def get_desired_velocity(self, ctx) -> np.ndarray:
+        skill = self.current_skill if not self._complete else None
+        return skill.get_desired_velocity(ctx) if skill else np.zeros(self.dof)
 
     # ------------------------------------------------------------------
     # 内部方法

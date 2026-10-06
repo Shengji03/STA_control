@@ -85,6 +85,11 @@ class TaskRunner:
             arm_offsets={'L': ARM_L_OFFSET, 'R': ARM_R_OFFSET},
             arm_yaws={'L': ARM_L_YAW, 'R': ARM_R_YAW}
         )
+        from ..task_planning.planning_service import PlanningService
+        self.planning_service = PlanningService(
+            self.model, self.data, {'L': ARM_L_OFFSET, 'R': ARM_R_OFFSET},
+            {'L': ARM_L_YAW, 'R': ARM_R_YAW},
+        )
 
         # Arm states
         self.arm_L = ArmState('L', ARM_L_OFFSET, ARM_L_YAW, SENSOR_L_OFFSET)
@@ -150,7 +155,7 @@ class TaskRunner:
         if not self.llm_planner:
             raise ValueError("No LLM planner or plan_dict provided")
 
-        snapshot = self.perception.get_scene_snapshot()
+        snapshot = self.perception.get_scene_snapshot(include_images=False)
         error_feedback = ""
         for attempt in range(1 + self._MAX_PLAN_RETRIES):
             plan_result = self.llm_planner.plan(
@@ -160,24 +165,37 @@ class TaskRunner:
                   f"{plan_result.get('reasoning', '')}")
 
             try:
-                self._try_parse_plan(plan_result)
+                self._try_parse_plan(plan_result, snapshot)
                 return
             except ValueError as e:
                 error_feedback = (
                     f"## 上一次规划失败\n\n"
                     f"错误信息: {e}\n\n"
-                    f"请修正规划。如果目标超出臂的可达范围, "
-                    f"必须先使用 NavSkill 将小车移动到目标附近, "
-                    f"然后再使用 MoveSkill。"
+                    f"请修正 goals/stages，保留全部必做目标和必需辅助。"
+                    f"如果目标超出可达范围，在 stage.nav 中调整小车停靠位置或 yaw。"
                 )
                 print(f"[TaskRunner] 规划失败 (attempt {attempt + 1}): {e}")
                 if attempt == self._MAX_PLAN_RETRIES:
                     raise
 
-    def _try_parse_plan(self, plan_result: dict):
+    def prepare_plan(self, plan_result, snapshot=None, instruction=None):
+        if snapshot is None:
+            snapshot = self.perception.get_scene_snapshot(include_images=False)
+        cart_pose = [*self._get_cart_state(), float(self.data.qpos[self._cart_yaw_qpos])]
+        return self.planning_service.prepare(
+            plan_result, snapshot, self.task_instruction if instruction is None else instruction, cart_pose,
+        )
+
+    def _try_parse_plan(self, plan_result: dict, snapshot=None):
         """Parse plan into phases. Raises ValueError on failure."""
         cart_state = self._get_cart_state()
-        parsed = self.plan_executor.parse(plan_result, cart_state[:2])
+        self.prepared_plan = self.prepare_plan(plan_result, snapshot)
+        self.planning_report = self.prepared_plan.get('optimization', {})
+        from ..task_planning.effects import EffectMonitor
+        self._effect_monitor = EffectMonitor(self.model, self.data, self.perception.registry,
+                                             self.prepared_plan.get('goals', []), self.planning_service.config)
+        parsed = self.plan_executor.parse(self.prepared_plan, cart_state[:2],
+                                          float(self.data.qpos[self._cart_yaw_qpos]))
 
         self._phases = parsed.get('phases', [])
         self._phase_index = 0
@@ -232,35 +250,11 @@ class TaskRunner:
             self.model, mujoco.mjtObj.mjOBJ_BODY, flange_name)
         arm.ctx.skill_start_time = self.data.time
 
-    def _build_R_cleanup_skills(self, r_setup_skills: list):
-        """Build R arm cleanup skills: reverse MoveSkills back, release, return."""
-        from ..skills.skills import GraspSkill as _GraspSkill
-        p_move = SKILL_STA_PARAMS[SkillType.MOVE]
-        p_grasp = SKILL_STA_PARAMS[SkillType.GRASP]
-
-        cleanup = []
-        reverse_targets = []
-        for skill in r_setup_skills:
-            if hasattr(skill, 'target_joints') and skill.target_joints is not None:
-                reverse_targets.append(skill.target_joints.copy())
-
-        for joints in reversed(reverse_targets):
-            cleanup.append(MoveSkill(
-                target_joints=joints, duration=3.0,
-                sta_params=p_move, name="R:回程",
-            ))
-
-        cleanup.append(_GraspSkill(
-            action='open', wait_time=0.8, sta_params=p_grasp,
-            name="R:释放遮光板",
-        ))
-        cleanup.append(self._make_return_skill())
-        return cleanup
-
     def _start_phase_execution(self, phase_index: int):
-        """Set up arm executors for a phase. Sequential: R first, then L."""
+        """Execute the explicit single, parallel, or setup/hold/cleanup mode."""
         phase = self._phases[phase_index]
         self._init_arms()
+        self._effect_monitor.start_phase(phase.get('goal_ids', []), phase['mode'] == 'assist_R_then_L')
 
         has_R = bool(phase.get('R', []))
         has_L = bool(phase.get('L', []))
@@ -268,17 +262,13 @@ class TaskRunner:
         self._pending_L_skills = None
         self._L_waiting_for_R = False
         self._R_cleanup_pending = False
-        self._R_setup_skills = None
+        self._R_cleanup_skills = None
         self._R_hold_position = None
 
         if has_R and has_L:
-            r_skills = list(phase['R'])
-            r_has_grasp = any(
-                hasattr(s, 'action') for s in r_skills
-            )
-
-            if r_has_grasp:
-                self._R_setup_skills = r_skills
+            if phase['mode'] == 'assist_R_then_L':
+                r_skills = list(phase['R'])
+                self._R_cleanup_skills = phase['R_cleanup']
                 self._setup_arm_executor('R', r_skills, phase_index,
                                          append_return=False)
                 self._pending_L_skills = phase['L']
@@ -343,7 +333,8 @@ class TaskRunner:
         s = arm.sensor_offset
         return self.data.sensordata[s:s + DOF].copy()
 
-    def _compute_arm_control(self, arm: ArmState, desired: np.ndarray) -> np.ndarray:
+    def _compute_arm_control(self, arm: ArmState, desired: np.ndarray,
+                             desired_velocity: np.ndarray = None) -> np.ndarray:
         """Compute STA control for one arm."""
         sensor = self._get_arm_sensor(arm)
         ts = self.model.opt.timestep
@@ -351,7 +342,9 @@ class TaskRunner:
         arm.prev_sensor = sensor.copy()
 
         error_pos = desired - sensor
-        error_vel = -vel
+        if desired_velocity is None:
+            desired_velocity = np.zeros(DOF)
+        error_vel = desired_velocity - vel
 
         ctrl = np.zeros(DOF)
         for i in range(DOF):
@@ -400,30 +393,35 @@ class TaskRunner:
             if self.arm_L.executor:
                 self.arm_L.ctx.current_time = t
                 L_done = self.arm_L.executor.update(self.arm_L.ctx)
+            self._effect_monitor.sample(self.arms)
 
             # L臂完成(含回初始位姿) → 启动R臂放回遮光板
             if (L_done and R_done and self._R_cleanup_pending
-                    and self._R_setup_skills is not None):
+                    and self._R_cleanup_skills is not None):
                 print(f"[{t:.2f}s] L臂完成, R臂开始放回遮光板")
                 prev_gripper = (self.arm_R.ctx.gripper_target
                                 if self.arm_R.ctx else 0.0)
                 sensor = self._get_arm_sensor(self.arm_R)
                 self.arm_R.robot.set_joint(sensor)
                 self.arm_R.prev_sensor = sensor.copy()
-                cleanup_skills = self._build_R_cleanup_skills(
-                    self._R_setup_skills)
+                cleanup_skills = self._R_cleanup_skills
                 self._setup_arm_executor('R', cleanup_skills,
-                                         self._phase_index,
-                                         append_return=False)
+                                         self._phase_index)
                 self.arm_R.ctx.gripper_target = prev_gripper
                 self._R_cleanup_pending = False
-                self._R_setup_skills = None
+                self._R_cleanup_skills = None
                 R_done = False
 
             # 全部完成 → 进入下一阶段
             if (L_done and R_done
                     and not self._L_waiting_for_R
                     and not self._R_cleanup_pending):
+                verified = self._effect_monitor.finish_phase(self._phases[self._phase_index].get('goal_ids', []))
+                self.execution_report = self._effect_monitor.report()
+                if not verified:
+                    self.state = 'FAILED'
+                    print('[TaskRunner] 执行效果未通过传感器校验:', self.execution_report)
+                    return
                 self._phase_index += 1
                 if self._phase_index < len(self._phases):
                     print(f"[TaskRunner] Phase {self._phase_index - 1} complete, "
@@ -477,8 +475,12 @@ class TaskRunner:
         self._pending_L_skills = None
         self._L_waiting_for_R = False
         self._R_cleanup_pending = False
-        self._R_setup_skills = None
+        self._R_cleanup_skills = None
         self._R_hold_position = None
+        self.prepared_plan = None
+        self.planning_report = {}
+        self.execution_report = {}
+        self._effect_monitor = None
         for arm in self.arms.values():
             arm.executor = None
             arm.ctx = None
@@ -495,6 +497,10 @@ class TaskRunner:
 
         for arm in self.arms.values():
             arm.prev_sensor = self._get_arm_sensor(arm)
+            params = SKILL_STA_PARAMS[SkillType.MOVE]
+            for index, controller in enumerate(arm.sta_controllers):
+                controller.reset()
+                controller.set_parameter(params['alpha'][index], params['beta'][index], params['lambda_s'][index])
 
         self._reset_runtime_state()
         self._is_started = False
@@ -558,7 +564,7 @@ class TaskRunner:
         t = self.data.time
         self._update_state(t)
 
-        if self.state == 'DONE':
+        if self.state in ('DONE', 'FAILED'):
             self._is_started = False
             return False
 
@@ -573,15 +579,18 @@ class TaskRunner:
             if arm.executor and not arm.executor.is_all_complete:
                 arm.ctx.current_time = t
                 desired = arm.executor.get_desired_position(arm.ctx)
+                desired_velocity = arm.executor.get_desired_velocity(arm.ctx)
             elif (label == 'R' and
                   (self._R_cleanup_pending or self._L_waiting_for_R)):
                 desired = (self._R_hold_position
                            if self._R_hold_position is not None
                            else self._get_arm_sensor(arm))
+                desired_velocity = np.zeros(DOF)
             else:
                 desired = INIT_Q
+                desired_velocity = np.zeros(DOF)
 
-            ctrl = self._compute_arm_control(arm, desired)
+            ctrl = self._compute_arm_control(arm, desired, desired_velocity)
 
             ctrl_start = self._L_ctrl_start if label == 'L' else self._R_ctrl_start
             for i in range(DOF):
@@ -653,7 +662,7 @@ class TaskRunner:
             for _ in step_loop():
                 pass
 
-        print("[TaskRunner] Pipeline complete.")
+        print(f"[TaskRunner] Pipeline stopped: {self.state}.")
         if show_trajectory:
             self._plot_trajectory_3d()
 

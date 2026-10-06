@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 
 from src.llm_planner.dialog_planner import DialogPlanner
 
@@ -36,3 +37,25 @@ def test_dialog_planner_does_not_retry_authentication_errors(monkeypatch):
         planner._query_llm("system", "user")
 
     assert completions.calls == 1
+
+
+def test_qwen_json_request_disables_thinking():
+    received = {}
+
+    class Completions:
+        def create(self, **kwargs):
+            received.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))],
+                usage=None,
+            )
+
+    planner = object.__new__(DialogPlanner)
+    planner.client = _FakeClient(Completions())
+    planner.model = "qwen3.8-flash"
+    planner.temperature = .2
+    planner.max_completion_tokens = 64
+    planner.verbose = False
+    assert planner._query_llm("Return JSON", "Return JSON", force_json=True) == '{"ok":true}'
+    assert received["extra_body"] == {"enable_thinking": False}
+    assert received["response_format"] == {"type": "json_object"}

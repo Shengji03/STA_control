@@ -408,10 +408,11 @@ class LongSequenceTask:
         self.ctx.current_time = current_time
         return self.executor.get_desired_position(self.ctx)
 
-    def compute_control(self, desired_pos, sensor_data, real_vel):
+    def compute_control(self, desired_pos, sensor_data, real_vel, desired_velocity=None):
         """计算控制量 (STA + DDPG 补偿)"""
         error_pos = desired_pos - sensor_data
-        desired_vel = (desired_pos - self._prev_desired_pos) / self.model.opt.timestep
+        desired_vel = ((desired_pos - self._prev_desired_pos) / self.model.opt.timestep
+                       if desired_velocity is None else desired_velocity)
         error_vel = desired_vel - real_vel
         self._prev_desired_pos = desired_pos.copy()
 
@@ -515,7 +516,8 @@ class LongSequenceTask:
                     old_training = self.ddpg_agent.training_enabled
                     self.ddpg_agent.set_training(False)
 
-                ctrl = self.compute_control(desired_pos, sensor_data, real_vel)
+                ctrl = self.compute_control(desired_pos, sensor_data, real_vel,
+                                            self.executor.get_desired_velocity(self.ctx))
 
                 if self.enable_ddpg and not train_ddpg:
                     self.ddpg_agent.set_training(old_training)

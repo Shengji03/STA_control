@@ -6,14 +6,14 @@ STA_control 的 Skill JSON 体系:
 
     1. Task 级语义校验 (根据任务指令和 prompts.py 中的硬规则)
     2. Reach 级校验 (复用 PlanExecutor 的 IK + 距离检查, 捕获 ValueError)
-    3. Collision 级校验 (把 plan 回放到 MuJoCo 模型上做前向碰撞检查)
+    3. Collision 级校验 (在临时 MuJoCo data 上采样导航、转向与关节轨迹)
 
 关键设计:
 - Reach 校验直接复用 `PlanExecutor.parse`, 它内部已对 target_pos 做 IK +
   0.85m reach 距离判断, 失败时抛 ValueError — 我们捕获并格式化成 feedback。
-- Collision 校验新建一个 `mujoco.MjData`, 把每个阶段的 nav+L/R target_joints
-  依次写入 qpos, 调 `mj_forward`, 读 `data.ncon` 统计接触对, 过滤同一条臂
-  内部的自接触, 剩下的视为真实碰撞报告给 LLM。
+- Collision 校验使用独立 MjData，不修改真实仿真。按显式执行模式回放，
+  并把夹取后的遮光板作为随 R 臂运动的物体检查。实际夹取仍由摩擦接触实现，
+  运行后的效果监测独立核验其是否保持、遮光和放回。
 """
 
 from __future__ import annotations
@@ -58,14 +58,16 @@ class FeedbackManager:
         arm_offsets: Dict[str, np.ndarray],
         arm_yaws: Dict[str, float],
         dof: int = 6,
+        collision_samples: int = 8,
     ):
         self.model = model
         self.data = data  # 只读引用, 用来获取当前 cart 位置
         self.dof = dof
+        self.collision_samples = collision_samples
 
         # 复用现有 PlanExecutor 做 IK + reach 校验
         self._plan_executor = PlanExecutor(
-            arm_offsets=arm_offsets, arm_yaws=arm_yaws
+            arm_offsets=arm_offsets, arm_yaws=arm_yaws, verbose=False,
         )
 
         # 解析关键 qpos/ctrl 索引 (与 TaskRunner._resolve_indices 保持一致)
@@ -75,6 +77,10 @@ class FeedbackManager:
         self._cart_yaw_qpos = model.jnt_qposadr[jid("cart_yaw")]
         self._L_qpos_start = model.jnt_qposadr[jid("shoulder_pan_joint")]
         self._R_qpos_start = model.jnt_qposadr[jid("shoulder_pan_joint_R")]
+        self._shade_board = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'shade_board')
+        board_joint = jid('shade_board_joint')
+        self._shade_qpos = int(model.jnt_qposadr[board_joint]) if board_joint >= 0 else None
+        self._R_flange = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'flange_R')
 
         # 构建 L/R 臂各自的 body id 集合, 用来过滤自接触
         self._L_arm_body_ids = self._collect_arm_body_ids(model, r_side=False)
@@ -90,6 +96,18 @@ class FeedbackManager:
         通过 body 名称后缀 _R 区分左右臂 body。
         若 body 名以某个 ARM_LINK_SUFFIXES 匹配, 且 (带 _R 与否) 匹配目标侧, 则归入。
         """
+        root = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                                'ur5e_base_R' if r_side else 'ur5e_base')
+        if root >= 0:
+            ids = set()
+            for body in range(model.nbody):
+                ancestor = body
+                while ancestor > 0:
+                    if ancestor == root:
+                        ids.add(body)
+                        break
+                    ancestor = int(model.body_parentid[ancestor])
+            return ids
         ids = set()
         for i in range(model.nbody):
             name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i) or ""
@@ -128,6 +146,14 @@ class FeedbackManager:
         """
         problems: List[str] = []
 
+        if 'goals' in plan_dict and 'execution_phases' not in plan_dict:
+            from ..task_planning.requests import semantic_request
+            try:
+                semantic_request(plan_dict, snapshot, task_instruction)
+                return True, ''
+            except (ValueError, TypeError, KeyError) as exc:
+                return False, f'目标/阶段结构校验失败: {exc}'
+
         # 1) Task 级语义校验 (廉价, 先做)
         task_problems = self._check_task_rules(plan_dict, task_instruction)
         problems.extend(task_problems)
@@ -163,6 +189,7 @@ class FeedbackManager:
         task = (task_instruction or "").strip()
 
         is_inspection = any(k in task for k in self._INSPECTION_KEYWORDS)
+        goal_operations = {g['id']: g.get('operation') for g in plan_dict.get('goals', [])}
 
         l_grasping = False
         r_grasping = False
@@ -173,7 +200,9 @@ class FeedbackManager:
             params = step.get("params", {}) or {}
 
             # 规则: 巡检类任务里 MoveSkill 应该是 R 臂
-            if is_inspection and skill in ("MoveSkill",) and arm == "L":
+            inspection_step = (goal_operations.get(step.get('goal_id')) == 'inspect'
+                               if goal_operations else is_inspection)
+            if inspection_step and skill in ("MoveSkill",) and arm == "L":
                 problems.append(
                     f"Step {i+1}: 巡检任务要求压力表观测由 R 臂完成, "
                     f"但这里分给了 L 臂。请改为 arm='R'。"
@@ -228,7 +257,7 @@ class FeedbackManager:
         cart_pos = self._current_cart_xy(snapshot)
 
         try:
-            parsed = self._plan_executor.parse(plan_dict, cart_pos)
+            parsed = self._plan_executor.parse(plan_dict, cart_pos, self._current_cart_yaw(snapshot))
             phases = parsed.get("phases", [])
             return phases, []
         except ValueError as e:
@@ -249,6 +278,10 @@ class FeedbackManager:
             self.data.qpos[self._cart_y_qpos],
         ])
 
+    def _current_cart_yaw(self, snapshot):
+        cart = snapshot.get('planner_state', {}).get('cart', {})
+        return float(cart.get('yaw', self.data.qpos[self._cart_yaw_qpos]))
+
     # ------------------------------------------------------------------
     # 3) 碰撞校验: 把 phases 回放到一份临时 MjData 上
     # ------------------------------------------------------------------
@@ -259,13 +292,11 @@ class FeedbackManager:
         self, phases: List[Dict], snapshot: Dict
     ) -> List[str]:
         """
-        对每个 phase 依次做:
-          - 如果有 nav, 把 cart qpos 设到 target
-          - 对该 phase 内 L/R 的每一个 target_joints (按 skill 顺序扫描),
-            写入 qpos, mj_forward, 收集接触对
-          - 过滤同臂自接触, 剩余报告给 LLM
-        注意: 为了简化, 我们只把 "含 target_joints 的 skill 的最后一帧" 做检查,
-              不做插值扫描 —— 这与 RoCo 的做法一致。
+        按执行模式采样导航、转向、关节轨迹、腕关节旋转和返回初始位姿。
+        遮光按 setup -> hold/main -> cleanup 回放；并行阶段按技能时长采样。
+        携带物的刚性相对位姿只用于几何预测，不强制实际仿真夹取。
+        延续同臂自接触过滤，仅允许目标物体与指定抓取臂手指的操作接触。
+        此采样检查不构成连续轨迹的碰撞证明。
         """
         data = mujoco.MjData(self.model)
         # 从当前状态拷贝 qpos / qvel / ctrl, 保证非臂/非 cart 关节状态正确
@@ -279,45 +310,150 @@ class FeedbackManager:
 
         problems: List[str] = []
 
+        held_board = None
         for p_idx, phase in enumerate(phases):
             nav = phase.get("nav")
             if nav and nav.get("target"):
                 tgt = nav["target"]
-                data.qpos[self._cart_x_qpos] = float(tgt[0])
-                data.qpos[self._cart_y_qpos] = float(tgt[1])
-                if nav.get("yaw") is not None:
-                    data.qpos[self._cart_yaw_qpos] = float(nav["yaw"])
+                start = data.qpos[[self._cart_x_qpos, self._cart_y_qpos]].copy()
+                yaw_start = float(data.qpos[self._cart_yaw_qpos])
+                # The runtime moves first and then turns; check the same order.
+                for fraction in np.linspace(0, 1, self.collision_samples + 1):
+                    data.qpos[[self._cart_x_qpos, self._cart_y_qpos]] = start + fraction * (np.asarray(tgt) - start)
+                    mujoco.mj_forward(self.model, data)
+                    hits = self._collect_contacts(data)
+                    if hits:
+                        problems.append(f'Phase {p_idx} 导航路径碰撞: ' + '; '.join(hits))
+                        break
+                if nav.get('yaw') is not None:
+                    for fraction in np.linspace(0, 1, self.collision_samples + 1):
+                        data.qpos[self._cart_yaw_qpos] = yaw_start + fraction * (float(nav['yaw']) - yaw_start)
+                        mujoco.mj_forward(self.model, data)
+                        hits = self._collect_contacts(data)
+                        if hits:
+                            problems.append(f'Phase {p_idx} 转向碰撞: ' + '; '.join(hits))
+                            break
 
-            # 收集该 phase 中每条臂所有出现过的 target_joints (按顺序)
-            L_targets = [s.target_joints for s in phase.get("L", [])
-                         if getattr(s, "target_joints", None) is not None]
-            R_targets = [s.target_joints for s in phase.get("R", [])
-                         if getattr(s, "target_joints", None) is not None]
-
-            # 同步扫描: 取两条臂的最大步数, 不足的用最后一帧 hold
-            n_steps = max(len(L_targets), len(R_targets))
-            for step_i in range(n_steps):
-                if L_targets:
-                    q_L = L_targets[min(step_i, len(L_targets) - 1)]
-                    data.qpos[self._L_qpos_start:self._L_qpos_start + self.dof] = q_L
-                if R_targets:
-                    q_R = R_targets[min(step_i, len(R_targets) - 1)]
-                    data.qpos[self._R_qpos_start:self._R_qpos_start + self.dof] = q_R
-
-                mujoco.mj_forward(self.model, data)
-
-                hits = self._collect_contacts(data)
+            allowed = phase.get('contact_targets', {})
+            mode = phase.get('mode', 'parallel')
+            if mode == 'assist_R_then_L':
+                segments = [('R', phase['R'], False), ('L', phase['L'], True),
+                            ('R', phase['R_cleanup'], True)]
+            else:
+                segments = [(arm, phase.get(arm, []), True) for arm in ('L', 'R')]
+            # Parallel main tasks are sampled with their actual duration profiles.
+            if mode == 'parallel':
+                hits = self._check_parallel(data, phase, allowed)
                 if hits:
-                    problems.append(
-                        f"Phase {p_idx} 第 {step_i+1} 帧检测到碰撞: "
-                        + "; ".join(hits)
-                    )
-                    # 单 phase 内只报一次碰撞即可, 避免反馈文本爆炸
+                    problems.append(f'Phase {p_idx} 并行轨迹碰撞: ' + '; '.join(hits))
+                continue
+            for arm, skills, return_home in segments:
+                address = self._L_qpos_start if arm == 'L' else self._R_qpos_start
+                targets = self._joint_targets(skills, data.qpos[address:address + self.dof])
+                if return_home and skills:
+                    targets.append((self.INIT_Q, 3.0))
+                replay = [(target, duration, skills[index] if index < len(skills) else None)
+                          for index, (target, duration) in enumerate(targets)]
+                for target, _duration, skill in replay:
+                    start = data.qpos[address:address + self.dof].copy()
+                    for fraction in np.linspace(0, 1, self.collision_samples + 1):
+                        data.qpos[address:address + self.dof] = start + fraction * (target - start)
+                        mujoco.mj_forward(self.model, data)
+                        if held_board is not None:
+                            self._place_held_board(data, held_board)
+                        hits = self._collect_contacts(data, allowed)
+                        if hits:
+                            problems.append(f'Phase {p_idx} {arm}臂轨迹碰撞: ' + '; '.join(hits))
+                            break
+                    if problems:
+                        break
+                    if (arm == 'R' and getattr(skill, 'action', None) == 'close'
+                            and 'shade_board' in allowed.get('R', []) and self._shade_qpos is not None):
+                        rotation = data.xmat[self._R_flange].reshape(3, 3)
+                        held_board = (rotation.T @ (data.xpos[self._shade_board] - data.xpos[self._R_flange]),
+                                      rotation.T @ data.xmat[self._shade_board].reshape(3, 3))
+                    elif arm == 'R' and getattr(skill, 'action', None) == 'open':
+                        held_board = None
+                if problems:
                     break
+            if problems:
+                break
 
         return problems
 
-    def _collect_contacts(self, data) -> List[str]:
+    def _place_held_board(self, data, relative_pose):
+        """Replay a rigid grasp in scratch data; never modify the live simulation.
+
+        The real grasp still uses friction contacts. This geometric model makes
+        the carried board part of collision checking; effects verify the grasp.
+        """
+        rotation = data.xmat[self._R_flange].reshape(3, 3)
+        position = data.xpos[self._R_flange] + rotation @ relative_pose[0]
+        board_rotation = rotation @ relative_pose[1]
+        quat = np.zeros(4)
+        mujoco.mju_mat2Quat(quat, board_rotation.reshape(9))
+        data.qpos[self._shade_qpos:self._shade_qpos + 3] = position
+        data.qpos[self._shade_qpos + 3:self._shade_qpos + 7] = quat
+        mujoco.mj_forward(self.model, data)
+
+    def _joint_targets(self, skills, initial):
+        targets, position = [], np.array(initial, dtype=float)
+        for skill in skills:
+            if getattr(skill, 'target_joints', None) is not None:
+                position = skill.target_joints.copy()
+            elif hasattr(skill, 'angle'):
+                position = position.copy()
+                position[skill.joint_index] += skill.angle
+            targets.append((position.copy(), float(getattr(skill, 'duration', getattr(skill, 'wait_time', 0.8)))))
+        return targets
+
+    def _check_parallel(self, data, phase, allowed):
+        profiles = {}
+        for arm, address in (('L', self._L_qpos_start), ('R', self._R_qpos_start)):
+            initial = data.qpos[address:address + self.dof].copy()
+            targets = self._joint_targets(phase[arm], initial) + [(self.INIT_Q, 3.0)]
+            profiles[arm] = (initial, targets, address)
+        end = max(sum(duration for _, duration in profile[1]) for profile in profiles.values())
+        boundaries = {0.0, end}
+        for _initial, targets, _address in profiles.values():
+            t = 0.0
+            for _, duration in targets:
+                boundaries.update(np.linspace(t, t + duration, self.collision_samples + 1).tolist())
+                t += duration
+        for time in sorted(boundaries):
+            for initial, targets, address in profiles.values():
+                previous, elapsed = initial, 0.0
+                for target, duration in targets:
+                    if time <= elapsed + duration:
+                        fraction = np.clip((time - elapsed) / max(duration, 1e-8), 0, 1)
+                        smooth = fraction * fraction * (3 - 2 * fraction)
+                        position = previous + smooth * (target - previous)
+                        break
+                    previous, elapsed = target, elapsed + duration
+                else:
+                    position = previous
+                data.qpos[address:address + self.dof] = position
+            mujoco.mj_forward(self.model, data)
+            hits = self._collect_contacts(data, allowed)
+            if hits:
+                return hits
+        return []
+
+    def _intended_contact(self, body1, body2, allowed):
+        for arm_body, target_body in ((body1, body2), (body2, body1)):
+            side = self._body_side(arm_body)
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, arm_body) or ''
+            if side is None or not any(word in name for word in ('finger', 'knuckle', 'pad')):
+                continue
+            targets = {('valve_body_' + target.split('_')[-1]) if target.startswith('valve_') else target
+                       for target in allowed.get(side, [])}
+            while target_body > 0:
+                if mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, target_body) in targets:
+                    return True
+                target_body = int(self.model.body_parentid[target_body])
+        return False
+
+    def _collect_contacts(self, data, allowed=None) -> List[str]:
         """
         扫描 data.contact 列表, 返回需要报告给 LLM 的碰撞对描述 (字符串列表)。
         过滤规则:
@@ -342,6 +478,9 @@ class FeedbackManager:
 
             # 两侧都不在任一条臂上 -> 与本次规划无关, 跳过
             if side1 is None and side2 is None:
+                continue
+
+            if allowed and self._intended_contact(b1, b2, allowed):
                 continue
 
             # 去重

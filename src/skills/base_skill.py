@@ -94,5 +94,9 @@ class BaseSkill(abc.ABC):
         """获取当前时刻的期望关节位置"""
         pass
 
+    def get_desired_velocity(self, ctx) -> np.ndarray:
+        """Stationary skills hold a fixed reference with zero desired velocity."""
+        return np.zeros(ctx.dof)
+
     def __repr__(self):
         return f"{self.__class__.__name__}('{self.name}')"

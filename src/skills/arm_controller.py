@@ -43,10 +43,11 @@ class ArmController:
         for controller in self.sta_controllers:
             controller.reset()
 
-    def compute_control(self, desired_pos, sensor_data, real_vel, ts):
+    def compute_control(self, desired_pos, sensor_data, real_vel, ts, desired_velocity=None):
         desired_pos = np.asarray(desired_pos)
         error_pos = desired_pos - sensor_data
-        desired_vel = (desired_pos - self._prev_desired) / ts
+        desired_vel = ((desired_pos - self._prev_desired) / ts if desired_velocity is None
+                       else np.asarray(desired_velocity))
         self._prev_desired = desired_pos.copy()
         error_vel = desired_vel - real_vel
         return np.array([

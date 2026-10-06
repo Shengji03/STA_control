@@ -12,6 +12,7 @@ src/
   config/             资源路径、机器人配置、LLM 环境配置
   perception/         场景对象登记、世界状态和相机快照
   llm_planner/        双臂协商、提示词、可执行性反馈
+  task_planning/      完整任务分工、次模辅助覆盖、公共规划服务、实际效果校验
   pipeline/           计划解析、任务协调、底盘导航、单臂状态
   skills/             技能原语、技能调度、实验共享单臂控制器
   controller/         STA、导纳和 DDPG
@@ -31,7 +32,9 @@ scripts/              独立辅助工具
 outputs/              生成的图片、模型权重、测试缓存（Git 忽略）
 ```
 
-目录职责及剩余整理项见 [结构说明](docs/architecture.md)。
+任务分工与辅助部署的公共入口为
+[PlanningService](src/task_planning/planning_service.py)，
+数学结构审查与实际场景验证位于 [experiments](experiments/)。
 
 ## 环境与依赖
 
@@ -54,13 +57,19 @@ python -m pip install -r requirements-dev.txt
 
 ```powershell
 $env:STA_LLM_API_KEY = "你的密钥"
-$env:STA_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-$env:STA_LLM_MODEL = "qwen3.5-plus"
+$env:STA_LLM_BASE_URL = "https://maas.qianwenaiapi.com/compatible-mode/v1"
+$env:STA_LLM_MODEL = "qwen3.8-flash"
 ```
 
-密钥读取优先级为 `STA_LLM_API_KEY`、`DASHSCOPE_API_KEY`、
-`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`。命令行显式参数优先于环境变量。
-`.env.example` 是配置示例，项目当前不会自动加载 `.env`。
+也可以将 `.env.example` 复制为项目根目录的 `.env`，填入自己的密钥，
+程序会自动读取，与启动进程的工作目录无关。
+配置优先级为命令行显式参数、进程环境变量、项目 `.env`、默认值。
+通过 `STA_ENV_FILE` 可以指定其他配置文件。
+
+千问/百炼地址读取 `STA_LLM_API_KEY` 或 `DASHSCOPE_API_KEY`，不会回退使用
+DeepSeek 或 OpenAI 的密钥；这些平台的密钥仅在对应服务地址下使用。
+通用兼容网关仍支持原有环境变量回退，显式设置 `STA_LLM_API_KEY` 最清楚。
+默认模型为 `qwen3.8-flash`，当前同步协商和 JSON 输出关闭思考模式。
 
 ## 启动任务
 
@@ -76,9 +85,27 @@ python run_dialog.py --task "遮光并旋拧1号阀门180度"
 python run_dialog.py --plan "D:\plans\task.json" --no-viewer --no-trajectory
 ```
 
-预置计划应包含 `plan` 数组。资源默认路径相对于项目位置解析，
+预置计划支持语义 `goals` + `stages`，也支持旧 `plan` 数组。
+完整阀门动作块可以自动参与分工优化；无法可靠识别的旧技能序列保留并校验。
+资源默认路径相对于项目位置解析，
 与启动进程的工作目录无关。可通过 `--scene` 显式指定场景。
 TCP 轨迹图保存至 `outputs/tcp_trajectory_3d.png`。
+
+LLM 输出目标、操作、必需遮光和导航阶段，代码展开完整技能块。
+规划服务枚举完整主臂分工，并为固定分工优化非负加权辅助覆盖收益；
+辅助候选不超过 12 个时穷举，较大集合预留必需辅助后使用边际收益贪心。
+主任务完整性、R 臂巡检规则、资源互斥、IK 和碰撞采样是执行前的硬校验。
+运行后再检查实际阀门角度、遮光期间的实际光路覆盖和遮光板放回。
+评分是几何/关节运动代理收益，不能解释为成功率，未套用原论文的近似界。
+
+仅查看规划、保存 JSON 报告，或设置辅助部署预算：
+
+```powershell
+python run_dialog.py --task "遮光并旋拧1号阀门180度" --plan-only --report outputs/plan.json
+python run_dialog.py --task "旋拧1号阀门180度" --aux-budget 0 --no-viewer --no-trajectory --report outputs/task.json
+```
+
+预算不足以满足指令中的必需遮光时会报错并重新规划，不能省略遮光后执行。
 
 ## 启动网页
 
@@ -110,6 +137,8 @@ python run_enterprise_web.py
 python -m experiments.pipeline_valve_task
 python -m experiments.pipeline_glare_task
 python -m experiments.long_sequence_task
+python -m experiments.submodular_planning
+python -m experiments.submodular_planning --simulate
 ```
 
 前两项启动预设任务及原生查看器。长时序实验保持原来的默认流程：
@@ -139,9 +168,15 @@ Windows 渲染测试可能产生 GLFW 警告；本次重构前的基线也存在
 
 ## 研究功能状态
 
-已经存在：结构化场景状态、双臂协商规划、计划反馈、技能调度、STA、
+已经存在：结构化场景状态、双臂协商规划、完整任务分工与阶段级次模辅助优化、
+计划反馈、实际效果校验、技能调度、STA、
 接触技能导纳、独立 DDPG 装配实验、网页任务下发与监控。
 
-后续需要实现：任务复杂度判别、HTN、次模优化、CARLA，以及网页中的
-控制曲线、实验对比、持久化和回放。DDPG 尚未接入网页任务主流程。
-重构阶段以已有任务行为为基线，算法扩展另行进行。
+当前方案由 LLM 给出目标与阶段顺序，再由完整动作模板和次模优化生成执行计划，
+已放弃任务复杂度判别和 HTN。网页继续采用 Vue + FastAPI，CARLA 暂缓。
+后续重点为控制曲线、实验对比、持久化和回放，以及 DDPG 补偿与主流程集成。
+目前辅助动作支持 R 臂遮光；压力表支持观测位到达，尚未实现读数识别。
+
+控制接口已按实际关节自由度提取抓取点雅可比；夹爪合外力采用世界轴的
+`[Fx, Fy, Fz, Mx, My, Mz]`，力矩与雅可比使用同一抓取点。
+跟踪速度误差包含轨迹速度和导纳补偿速度，导纳按技能限制补偿位移和速度。
