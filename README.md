@@ -27,14 +27,12 @@ src/
   assets/             MuJoCo 场景、机器人及夹爪资源
 experiments/          预设任务、训练实验、评价指标和对比报告
 web_frontend/         Vue 界面
-tests/                Python 回归测试
-scripts/              独立辅助工具
-outputs/              生成的图片、模型权重、测试缓存（Git 忽略）
+outputs/              实验结果、模型权重和网页历史数据（Git 忽略）
 ```
 
 任务分工与辅助部署的公共入口为
 [PlanningService](src/task_planning/planning_service.py)，
-数学结构审查与实际场景验证位于 [experiments](experiments/)。
+规划对比与实际场景实验位于 [experiments](experiments/)。
 
 ## 环境与依赖
 
@@ -44,11 +42,11 @@ Robotics Toolbox 1.1.1、SpatialMath 1.1.15。
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements-web.txt
 ```
 
 `requirements.txt` 声明机器人运行和实验依赖；`requirements-web.txt`
-在此基础上添加网页后端；`requirements-dev.txt` 添加 Python 测试依赖。
+在此基础上添加网页后端。
 这些文件是依赖清单，尚未作为完整锁定文件。
 
 ## 大模型配置
@@ -166,18 +164,15 @@ python -m experiments.submodular_planning --simulate
 未接入任务的笛卡尔路径、混合路径、五次插值、二维 RRT 和 RRT* 变体
 已删除。现存场景为装配 `scene3`、管道 `scene4_pipeline` 和遮光 `scene5_glare`。
 
-## 验证
+## 前端构建检查
 
 ```powershell
-python -m pytest -q
 cd web_frontend
-npm.cmd test
 npm.cmd run build
 ```
 
-测试包括现有网页和渲染流程，以及配置优先级、导航时序、预置计划、
-共享控制器输出、实验指标，以及清理前记录的轨迹、碰撞和 RRT 路径。
-Windows 渲染测试可能产生 GLFW 警告；本次重构前的基线也存在此现象。
+自动测试文件及其专用依赖已移除。运行检查可通过网页中的离线示例任务，
+以及上述独立实验入口进行。
 
 ## 研究功能状态
 

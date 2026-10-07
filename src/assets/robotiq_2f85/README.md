@@ -11,10 +11,6 @@ by [Robotiq](https://robotiq.com/). It is derived from the [publicly available
 URDF
 description](https://github.com/ros-industrial/robotiq/tree/kinetic-devel/robotiq_2f_85_gripper_visualization).
 
-<p float="left">
-  <img src="2f85.png" width="400">
-</p>
-
 ## URDF → MJCF derivation steps
 
 1. Added `<mujoco> <compiler discardvisual="false"/> </mujoco>` to the URDF's

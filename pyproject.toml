@@ -1,3 +1,0 @@
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-cache_dir = "outputs/.pytest_cache"

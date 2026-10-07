@@ -10,10 +10,6 @@ This package contains a simplified robot description (MJCF) of the
 [publicly available URDF
 description](https://github.com/ros-industrial/universal_robot/tree/kinetic-devel/ur_e_description).
 
-<p float="left">
-  <img src="ur5e.png" width="400">
-</p>
-
 ### URDF → MJCF derivation steps
 
 1. Converted the DAE [mesh
