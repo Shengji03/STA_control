@@ -48,6 +48,7 @@ class PerceptionModule:
         resolution: Tuple[int, int] = (1280, 720),
         scene_path: Optional[str] = None,
         registry: Optional[SceneObjectRegistry] = None,
+        enable_rendering: bool = True,
     ):
         """
         Args:
@@ -75,18 +76,19 @@ class PerceptionModule:
         self._renderer = None
         self._low_level = None
 
-        try:
-            self._renderer = mujoco.Renderer(
-                model, height=resolution[1], width=resolution[0])
-            self._renderer.update_scene(data)
-            self._renderer.render()
-            print("[Perception] 使用高层 Renderer API")
-        except Exception as e:
-            print(f"[Perception] 高层 Renderer 不可用 ({e}), 回退到低层 API")
-            self._use_high_level = False
-            self._renderer = None
-            self._low_level = _create_offscreen_context(
-                model, resolution[0], resolution[1])
+        if enable_rendering:
+            try:
+                self._renderer = mujoco.Renderer(
+                    model, height=resolution[1], width=resolution[0])
+                self._renderer.update_scene(data)
+                self._renderer.render()
+                print("[Perception] 使用高层 Renderer API")
+            except Exception as e:
+                print(f"[Perception] 高层 Renderer 不可用 ({e}), 回退到低层 API")
+                self._use_high_level = False
+                self._renderer = None
+                self._low_level = _create_offscreen_context(
+                    model, resolution[0], resolution[1])
 
         self._body_ids = {}
         for name in self.tracked_bodies:
@@ -113,6 +115,8 @@ class PerceptionModule:
 
     def render_camera(self, camera_name: str) -> np.ndarray:
         """渲染指定相机的 RGB 图像, 返回 (H, W, 3) uint8 数组"""
+        if self._renderer is None and self._low_level is None:
+            raise RuntimeError('Perception rendering is disabled for this headless run')
         if self._use_high_level:
             self._renderer.update_scene(self.data, camera=camera_name)
             return self._renderer.render().copy()

@@ -22,6 +22,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--plan-only', action='store_true', help='完成 LLM、分工优化和校验，打印结果，不运行仿真')
     parser.add_argument('--report', type=Path, help='保存优化计划与实际执行效果 JSON')
     parser.add_argument('--aux-budget', type=int, default=None, help='最多部署几次辅助；0 表示禁用辅助')
+    parser.add_argument('--sta-parameters', type=Path, help='经过长程验证的 CARLA 参数库 JSON')
     return parser.parse_args(argv)
 
 
@@ -50,10 +51,13 @@ def main(argv=None) -> int:
         planner = create_planner(settings)
 
     from src.pipeline.task_runner import TaskRunner
+    from src.controller.control_parameters import SkillParameterBank
 
     runner = TaskRunner(
         scene_path=str(args.scene.resolve()), llm_planner=planner,
         task_instruction=args.task, plan_dict=plan,
+        render_perception=not args.no_viewer,
+        sta_parameters=SkillParameterBank.load(args.sta_parameters) if args.sta_parameters else None,
     )
     if planner is not None:
         print(f"[LLM] model={settings.model_name}, base_url={settings.base_url}")

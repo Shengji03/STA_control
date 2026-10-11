@@ -34,7 +34,7 @@ def main_steps(goal, arm, objects):
     point = object_point(objects, goal.target, "handle_center")
     return (_move(arm, point + [0, 0, 0.12], goal.id),
             _move(arm, point, goal.id, duration=2.5),
-            step(arm, "GraspSkill", {"action": "close"}, goal.id),
+            step(arm, "GraspSkill", {"action": "close", "gripper_closed": .4}, goal.id),
             # The down-facing wrist axis opposes the valve's world +z axis.
             step(arm, "RotateSkill", {"angle": -goal.angle, "duration": 5.0}, goal.id),
             step(arm, "GraspSkill", {"action": "open"}, goal.id),

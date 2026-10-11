@@ -89,6 +89,8 @@ class PlanExecutor:
                         raise ValueError('arm 必须为 L/R')
                     skill = self._parse_step(step, effective_pos, effective_yaw)
                     skill.goal_id = step.get('goal_id')
+                    skill.target_object = next((g['object'] for g in llm_result.get('goals', [])
+                                                if g['id'] == skill.goal_id), None)
                     phase[arm].append(skill)
                 for step in raw.get('cleanup_R', []):
                     if step.get('arm') != 'R':

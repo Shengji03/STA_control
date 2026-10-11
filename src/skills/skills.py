@@ -187,6 +187,9 @@ class GraspSkill(BaseSkill):
 
     def setup(self, ctx):
         self._gripper_start = ctx.gripper_target
+        # Preserve the preceding compensated command, including admittance offsets.
+        self._hold_q = (ctx.last_reference.copy() if ctx.last_reference is not None
+                        else ctx.data.qpos[ctx.joint_qpos_indices].copy())
         if self.action == 'close':
             self._gripper_end = self.gripper_closed
         else:
@@ -202,7 +205,7 @@ class GraspSkill(BaseSkill):
     def get_desired_position(self, ctx):
         alpha = min(ctx.elapsed / self.wait_time, 1.0)
         ctx.gripper_target = self._gripper_start + alpha * (self._gripper_end - self._gripper_start)
-        return np.array(ctx.robot.get_joint())
+        return self._hold_q.copy()
 
 
 class RotateSkill(AdmittanceTrajectorySkill):

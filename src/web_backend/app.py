@@ -67,7 +67,8 @@ class SimulationRuntime:
         if self.enabled:
             config = SimulationConfig(scene_path=self.settings.scene_path, width=self.settings.width,
                                       height=self.settings.height, fps=self.settings.fps,
-                                      jpeg_quality=self.settings.jpeg_quality)
+                                      jpeg_quality=self.settings.jpeg_quality,
+                                      sta_parameters=self.settings.sta_parameters)
             self.worker = SimulationWorker(config, self._receive_event)
             self.worker.start()
             self.session = self.worker.session

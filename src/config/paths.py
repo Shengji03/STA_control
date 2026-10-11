@@ -10,6 +10,7 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 MODELS_DIR = OUTPUTS_DIR / "models"
 DEFAULT_SCENE_PATH = SCENES_DIR / "scene5_glare.xml"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "web_frontend" / "dist"
+DEFAULT_STA_PARAMETERS = PROJECT_ROOT / "src" / "config" / "sta_skill_parameters.json"
 
 
 def scene_path(name: str) -> Path:

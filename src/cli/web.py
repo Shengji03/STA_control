@@ -17,6 +17,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--quality", type=int, default=80)
     parser.add_argument("--no-simulation", action="store_true")
+    parser.add_argument('--sta-parameters', type=Path, help='经过完整任务验证的 CARLA 参数库')
     return parser.parse_args(argv)
 
 
@@ -30,6 +31,7 @@ def main(argv=None) -> None:
     settings = BackendSettings(
         scene_path=args.scene.resolve(), frontend_dist=args.frontend_dist.resolve(),
         width=args.width, height=args.height, fps=args.fps, jpeg_quality=args.quality,
+        sta_parameters=args.sta_parameters,
     )
     app = create_app(enable_simulation=not args.no_simulation, settings=settings)
     uvicorn.run(app, host=args.host, port=args.http_port)

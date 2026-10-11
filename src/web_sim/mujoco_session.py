@@ -15,6 +15,7 @@ from src.config.paths import DEFAULT_SCENE_PATH, PROJECT_ROOT
 from .camera import CameraCommand, CameraState
 from .frame_codec import encode_jpeg
 from .trajectory import nominal_preview, telemetry_sample, trajectory_metrics
+from src.controller.control_parameters import CONTROL_VERSION
 
 
 @dataclass
@@ -46,6 +47,7 @@ class SimulationConfig:
     fps: int = 20
     jpeg_quality: int = 80
     camera: CameraState = field(default_factory=CameraState)
+    sta_parameters: Path | None = None
 
     @property
     def frame_interval(self) -> float:
@@ -59,6 +61,7 @@ class SimulationConfig:
             fps=max(1, int(self.fps)),
             jpeg_quality=max(1, min(int(self.jpeg_quality), 95)),
             camera=self.camera,
+            sta_parameters=self.sta_parameters,
         )
 
 
@@ -68,7 +71,9 @@ class MujocoStreamSession:
     def __init__(self, config: SimulationConfig):
         self.config = config.normalized()
         self._lock = RLock()
-        self.runner = TaskRunner(scene_path=str(self.config.scene_path))
+        from src.controller.control_parameters import SkillParameterBank
+        self._parameter_bank = SkillParameterBank.load(self.config.sta_parameters) if self.config.sta_parameters else None
+        self.runner = TaskRunner(scene_path=str(self.config.scene_path), sta_parameters=self._parameter_bank)
         self.model = self.runner.model
         self.data = self.runner.data
         self.renderer = mujoco.Renderer(
@@ -104,7 +109,7 @@ class MujocoStreamSession:
         if self.config.scene_path.name != scene:
             from src.config.paths import SCENES_DIR
             self.runner.perception._renderer.close()
-            self.runner = TaskRunner(str(SCENES_DIR / scene))
+            self.runner = TaskRunner(str(SCENES_DIR / scene), sta_parameters=self._parameter_bank)
             self.model, self.data = self.runner.model, self.runner.data
             self.renderer.close()
             self.renderer = mujoco.Renderer(self.model, height=self.config.height, width=self.config.width)
@@ -140,6 +145,10 @@ class MujocoStreamSession:
             return deepcopy(self._replay_data)
         task = self._active_task or self._last_task
         return {'task_id': task.task_id if task else None, 'scene': self.config.scene_path.name,
+                'control_version': CONTROL_VERSION, 'torque_source': 'actuator_force',
+                'sta_parameters': ({'source': Path(self.config.sta_parameters).name,
+                                    'entries': deepcopy(self._parameter_bank.entries)}
+                                   if self._parameter_bank else None),
                 'plan': task.plan_dict if task else None, 'preview': task.preview if task else None,
                 'samples': deepcopy(self._samples), 'optimization': self.runner.planning_report,
                 'execution_effects': self.runner.execution_report, 'metrics': trajectory_metrics(self._samples)}

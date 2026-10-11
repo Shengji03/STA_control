@@ -45,6 +45,13 @@ class SkillContext:
         self.joint_qpos_indices = np.asarray(model.jnt_qposadr[self.joint_ids], dtype=int)
         first_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, int(self.joint_ids[0])) or ''
         suffix = '_R' if first_name.endswith('_R') else ''
+        self.arm_label = 'R' if suffix else 'L'
+        self.parameter_bank = None
+        self.execution_stage = 'main'
+        self.last_reference = None
+        cart_ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                    for name in ('cart_x', 'cart_y', 'cart_yaw')]
+        self.cart_qpos_indices = model.jnt_qposadr[cart_ids] if min(cart_ids) >= 0 else None
         self.flange_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'flange' + suffix)
         self.control_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'pinch' + suffix)
         self._wrench_body_id = None
@@ -225,7 +232,9 @@ class SkillExecutor:
         skill = self.current_skill
         if skill is None:
             return np.array(ctx.robot.get_joint())
-        return skill.get_desired_position(ctx)
+        reference = skill.get_desired_position(ctx)
+        ctx.last_reference = np.asarray(reference).copy()
+        return reference
 
     def get_desired_velocity(self, ctx) -> np.ndarray:
         skill = self.current_skill if not self._complete else None
@@ -258,6 +267,18 @@ class SkillExecutor:
 
         # 应用技能专属 STA 参数
         params = skill.sta_params
+        if ctx.parameter_bank is not None:
+            params = ctx.parameter_bank.resolve(ctx.arm_label, skill.skill_type, params,
+                {'scene': getattr(ctx, 'scene_name', None), 'object': getattr(skill, 'target_object', None),
+                 'angle': getattr(skill, 'angle', None),
+                 'action': getattr(skill, 'action', None),
+                 'workflow': getattr(ctx, 'workflow_tag', None),
+                 'stage': ctx.execution_stage,
+                 'goal_count': getattr(ctx, 'workflow_goal_count', None),
+                 'goal_objects': getattr(ctx, 'workflow_goal_objects', None),
+                 'goal_angles': getattr(ctx, 'workflow_goal_angles', None),
+                 'duration': getattr(skill, 'duration', getattr(skill, 'wait_time', None)),
+                 'cart_pose': ctx.data.qpos[ctx.cart_qpos_indices].tolist() if ctx.cart_qpos_indices is not None else None})
         for i in range(self.dof):
             self.sta_controllers[i].set_parameter(
                 params['alpha'][i], params['beta'][i], params['lambda_s'][i]

@@ -147,7 +147,7 @@ def build_valve_task(joint_targets, sta_params=None):
     return [
         MoveSkill(t['valve_approach'], duration=3.0, sta_params=p_move,   name="移到手轮上方"),
         MoveSkill(t['valve_grasp'],    duration=2.5, sta_params=p_move,   name="下降到手轮"),
-        GraspSkill(action='close', wait_time=1.0, gripper_closed=0.35,
+        GraspSkill(action='close', wait_time=1.0, gripper_closed=0.4,
                    sta_params=p_grasp, name="抓取手轮辐条"),
         RotateSkill(angle=np.pi, duration=5.0, joint_index=5,
                     sta_params=p_rotate, name="旋拧阀门"),

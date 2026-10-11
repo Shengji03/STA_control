@@ -28,7 +28,7 @@ DEFAULT_STA_PARAMS = {
     'lambda_s': [15, 12, 25, 20, 15, 15],
 }
 
-# 按技能区分的 STA 参数 (参考 PID 版各技能增益比例, alpha=8~15, beta=15~40)
+# 按技能区分的基准比例；下方转换为真实力矩执行器的校准参数。
 SKILL_STA_PARAMS = {
     SkillType.MOVE: {
         'alpha':    [10, 10, 10, 8,  8,  8],
@@ -63,6 +63,16 @@ SKILL_STA_PARAMS = {
 }
 
 
+# Calibrated starting point for unit-gain torque actuators with bias compensation.
+# The former values were exercised through a position servo, not a torque input.
+for _params in [DEFAULT_STA_PARAMS, *SKILL_STA_PARAMS.values()]:
+    _factor = 8 if any(_params is p for p in (SKILL_STA_PARAMS[SkillType.ROTATE],
+                        SKILL_STA_PARAMS[SkillType.MOVE], SKILL_STA_PARAMS[SkillType.GRASP], DEFAULT_STA_PARAMS)) else 4
+    _params['alpha'] = (_factor * np.asarray(_params['alpha'], dtype=float)).tolist()
+    _params['beta'] = (_factor * np.asarray(_params['beta'], dtype=float)).tolist()
+del _params, _factor
+
+
 class BaseSkill(abc.ABC):
     """
     技能基类
@@ -76,7 +86,7 @@ class BaseSkill(abc.ABC):
     def __init__(self, skill_type: SkillType, sta_params: dict = None,
                  name: str = ""):
         self.skill_type = skill_type
-        self.sta_params = sta_params if sta_params is not None else DEFAULT_STA_PARAMS
+        self.sta_params = sta_params if sta_params is not None else SKILL_STA_PARAMS.get(skill_type, DEFAULT_STA_PARAMS)
         self.name = name or skill_type.name
 
     @abc.abstractmethod

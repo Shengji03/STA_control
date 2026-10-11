@@ -24,6 +24,7 @@ from src.config.robot import INITIAL_JOINTS
 from experiments.metrics import calculate_tracking_metrics
 from experiments.reporting import print_comparison, plot_comparison
 from src.controller import STAController, DDPGAgent
+from src.controller.arm_torque import compute_arm_torque
 from src.perception import build_world_state
 from src.robot import UR5e
 from src.skills import (
@@ -183,7 +184,9 @@ def build_assembly_task(joint_targets, sta_params=None):
         # ===== Phase 1: 插销A -> 凹槽A =====
         MoveSkill(t['pin_a_above'],       duration=3.0, sta_params=p_move,    name="移到插销A上方"),
         MoveSkill(t['pin_a_grasp'],       duration=2.0, sta_params=p_move,    name="下降到插销A"),
-        GraspSkill(action='close',                      sta_params=p_grasp,   name="抓取插销A"),
+        # The round pin needs less closure than the rectangular block/pin B.
+        # Excessive squeezing biases it sideways against the socket wall.
+        GraspSkill(action='close', gripper_closed=.575, sta_params=p_grasp,  name="抓取插销A"),
         MoveSkill(t['pin_a_lift'],        duration=2.0, sta_params=p_move,    name="提起插销A"),
         MoveSkill(t['socket_a_above'],    duration=3.0, sta_params=p_move,    name="移到凹槽A上方"),
         InsertSkill(t['socket_a_insert'], duration=4.0, sta_params=p_insert,  name="插入凹槽A"),
@@ -194,7 +197,7 @@ def build_assembly_task(joint_targets, sta_params=None):
         # ===== Phase 2: 平移物块 =====
         MoveSkill(t['block_above'],         duration=3.0, sta_params=p_move,      name="移到物块上方"),
         MoveSkill(t['block_grasp'],         duration=2.0, sta_params=p_move,      name="下降到物块"),
-        GraspSkill(action='close',                        sta_params=p_grasp,     name="抓取物块"),
+        GraspSkill(action='close', gripper_closed=.6,     sta_params=p_grasp,     name="抓取物块"),
         TranslateSkill(t['block_translate'],duration=4.0, sta_params=p_translate, name="平移物块"),
         GraspSkill(action='open', wait_time=0.5,          sta_params=p_grasp,     name="释放物块"),
         MoveSkill(t['block_retract'],       duration=2.0, sta_params=p_move,      name="退出物块区"),
@@ -202,7 +205,7 @@ def build_assembly_task(joint_targets, sta_params=None):
         # ===== Phase 3: 拔出插销B -> 放置 =====
         MoveSkill(t['socket_b_above'],    duration=3.0, sta_params=p_move,    name="移到凹槽B上方"),
         MoveSkill(t['socket_b_grasp'],    duration=2.0, sta_params=p_move,    name="下降到插销B"),
-        GraspSkill(action='close',                      sta_params=p_grasp,   name="抓取插销B"),
+        GraspSkill(action='close', gripper_closed=.6,   sta_params=p_grasp,   name="抓取插销B"),
         ExtractSkill(t['socket_b_above'], duration=3.0, sta_params=p_extract, name="拔出插销B"),
         MoveSkill(t['place_b_above'],     duration=3.0, sta_params=p_move,    name="移到放置位上方"),
         MoveSkill(t['place_b_put'],       duration=2.0, sta_params=p_move,    name="下降放置"),
@@ -229,7 +232,7 @@ class LongSequenceTask:
 
     def __init__(self, model_path: str, enable_ddpg: bool = True,
                  disturbance_cfg: dict = None, scene_cfg: dict = None,
-                 sta_params: dict = None):
+                 sta_params: dict = None, sta_parameters=None, model=None):
         # ========== 扰动配置 ==========
         if disturbance_cfg is None:
             self.disturbance_cfg = {
@@ -247,7 +250,7 @@ class LongSequenceTask:
         self._joint_torque_scale = np.array([1.0, 1.2, 1.0, 0.4, 0.4, 0.3])
         self._random_walk_torque = np.zeros(6)
 
-        self.model = mujoco.MjModel.from_xml_path(model_path)
+        self.model = model if model is not None else mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
 
@@ -258,6 +261,7 @@ class LongSequenceTask:
         world_state = build_world_state(self.model, self.data, scene_path=model_path)
         self.scene_cfg = scene_cfg or default_scene_config(world_state)
         self.sta_params = sta_params or DEFAULT_STA_PARAMS
+        self._sta_override = sta_params
 
         # ========== 预计算目标关节角 ==========
         self.joint_targets = precompute_joint_targets(
@@ -277,11 +281,15 @@ class LongSequenceTask:
         ]
 
         # ========== 技能序列 & 执行器 ==========
-        self.skills = build_assembly_task(self.joint_targets, self.sta_params)
+        self.skills = build_assembly_task(self.joint_targets, self._sta_override)
         self.executor = SkillExecutor(
             self.skills, self.sta_controllers, self.dof
         )
         self.ctx = SkillContext(self.model, self.data, self.robot, self.dof)
+        self.ctx.scene_name = os.path.basename(model_path)
+        self.ctx.workflow_tag = 'assembly'
+        self.ctx.parameter_bank = sta_parameters
+        self._tag_objects()
 
         self._print_skill_sequence(self.skills)
 
@@ -310,6 +318,10 @@ class LongSequenceTask:
         for i, s in enumerate(skills):
             print(f"  [{i + 1:>2}] {s}")
         print()
+
+    def _tag_objects(self):
+        for index, skill in enumerate(self.skills):
+            skill.target_object = 'pin_a' if index < 9 else 'block' if index < 15 else 'pin_b'
 
     # ------------------------------------------------------------------
     # DDPG 初始化
@@ -367,7 +379,8 @@ class LongSequenceTask:
         self.control_total_history = []
 
         # 重建技能序列 & 重置执行器
-        self.skills = build_assembly_task(self.joint_targets, self.sta_params)
+        self.skills = build_assembly_task(self.joint_targets, self._sta_override)
+        self._tag_objects()
         self.executor = SkillExecutor(
             self.skills, self.sta_controllers, self.dof
         )
@@ -417,9 +430,8 @@ class LongSequenceTask:
         self._prev_desired_pos = desired_pos.copy()
 
         # STA 滑模控制
-        ctrl_sta = np.zeros(self.dof)
-        for i in range(self.dof):
-            ctrl_sta[i] = self.sta_controllers[i].control(error_pos[i], error_vel[i])
+        ctrl_sta = compute_arm_torque(self.model, self.data, self.sta_controllers,
+                                      np.arange(self.dof), desired_pos, desired_vel, sensor_data, real_vel)
 
         # DDPG 补偿
         if self.enable_ddpg:

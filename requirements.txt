@@ -1,8 +1,8 @@
-# Runtime and experiment dependencies. NumPy 1.x matches the validated robotics runtime.
-numpy>=1.26,<2
-mujoco>=3.3,<4
-roboticstoolbox-python>=1.1,<2
-spatialmath-python>=1.1,<2
+# Pin simulation/kinematics versions used by the validated CARLA parameter bank.
+numpy==1.26.4
+mujoco==3.3.7
+roboticstoolbox-python==1.1.1
+spatialmath-python==1.1.15
 Pillow>=10
 openai>=1
 python-dotenv>=1.2,<2

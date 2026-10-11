@@ -1,6 +1,7 @@
 from typing import List
 
 import numpy as np
+from math import cos, sin
 import roboticstoolbox as rtb
 from spatialmath import SE3
 
@@ -139,11 +140,20 @@ class UR5e(Robot):
         return qs
 
     def setRobotConfig(self, q):
-        T = self.fkine(q)
-        wpc = self.cal_wpc(T)
         thetas = [q[i] + self.theta_array[i] for i in range(self._dof)]
-
-        if wrap(np.arctan2(wpc[1], wpc[0]) - wrap(thetas[0])[0])[0] <= np.pi / 2:
+        # Wrist-center projection is Rz(theta1) @ [radial, d4]. Since d4>0,
+        # the original azimuth test is exactly the sign of radial. This avoids
+        # building six SE3 link transforms on every 2 ms control step.
+        radial = (self.a_array[2] * cos(thetas[1])
+                  + self.a_array[3] * cos(thetas[1] + thetas[2])
+                  + self.d_array[4] * sin(thetas[1] + thetas[2] + thetas[3]))
+        if abs(radial) < 1e-10:
+            # Preserve the existing floating-point convention at the boundary.
+            wpc = self.cal_wpc(self.fkine(q))
+            overhead_zero = wrap(np.arctan2(wpc[1], wpc[0]) - wrap(thetas[0])[0])[0] <= np.pi / 2
+        else:
+            overhead_zero = radial >= 0
+        if overhead_zero:
             self.robot_config.overhead = 0
         else:
             self.robot_config.overhead = 1

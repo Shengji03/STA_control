@@ -50,7 +50,7 @@ const series = computed(() => {
     }));
   return [
     {
-      name: "STA 控制力矩",
+      name: props.detail?.torque_source === 'actuator_force' ? '关节实际力矩' : '记录控制输出',
       color: "#725ae5",
       values: a.map((s) => s.torque[joint.value]!),
     },
@@ -58,6 +58,7 @@ const series = computed(() => {
 });
 const unit = computed(
   () =>
+    tab.value === 'torque' && !props.detail?.control_version ? '原始值' :
     (
       ({ position: "rad", error: "mm", force: "N", torque: "N·m" }) as Record<
         string,

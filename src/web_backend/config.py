@@ -13,4 +13,5 @@ class BackendSettings:
     fps: int = 20
     jpeg_quality: int = 80
     data_dir: Path = OUTPUTS_DIR / 'web'
+    sta_parameters: Path | None = None
 

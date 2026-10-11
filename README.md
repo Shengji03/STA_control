@@ -47,7 +47,8 @@ python -m pip install -r requirements-web.txt
 
 `requirements.txt` 声明机器人运行和实验依赖；`requirements-web.txt`
 在此基础上添加网页后端。
-这些文件是依赖清单，尚未作为完整锁定文件。
+仿真与运动学依赖固定为已验证版本；其余服务依赖按清单范围安装，
+这些文件尚未完整锁定所有间接依赖。
 
 ## 大模型配置
 
@@ -152,6 +153,134 @@ python -m experiments.submodular_planning
 python -m experiments.submodular_planning --simulate
 ```
 
+## CARLA 训练与交付
+
+CARLA 是连续动作强化学习自动机。本项目使用 Python + MuJoCo 离线学习
+STA 的 alpha、beta、lambda_s 三个正倍率，分别缩放技能六关节的基准数组。
+导纳保持固定，训练和验收不使用 LLM、DDPG 或渲染器。
+
+训练代码统一位于 `experiments/carla/`：
+
+| 文件 | 职责 |
+|---|---|
+| `__main__.py` | 统一命令入口与显式安装已验证参数 |
+| `training.py` | 可恢复搜索、原子写入、日志对齐、源码指纹 |
+| `benchmarks.py` | 真实前序状态、技能交接、完整任务和物体效果 |
+| `suite.py` | 多技能、多种子训练、完整组合选择和留出验收 |
+| `refinement.py` | 从已有候选重新选择装配、重复旋拧、遮光组合参数 |
+| `evaluate.py` | 运行完整任务，保存指标和运动时序，可选查看器 |
+| `exports.py` | CSV、科学图、代表或全部工况时序导出 |
+
+算法和运行时参数加载分别位于 `src/controller/carla_tuner.py`、
+`control_parameters.py`；验收规则在 `control_metrics.py` 中共享。
+当前唯一随代码交付的参数库是 `src/config/sta_skill_parameters.json`。
+旧单技能试跑、旋拧专用训练和一次性收尾入口已删除。
+
+### 使用已训练参数
+
+```powershell
+python -X utf8 -B run_enterprise_web.py --sta-parameters src/config/sta_skill_parameters.json
+python -X utf8 -B run_dialog.py --task "遮光并旋拧1号阀门180度" --sta-parameters src/config/sta_skill_parameters.json
+python -X utf8 -B -m experiments.carla evaluate --family repeat --angle-deg 120 --arm-order LR --sta-parameters src/config/sta_skill_parameters.json --output outputs/carla/manual_repeat_new
+python -X utf8 -B -m experiments.carla evaluate --family assembly --assembly-order 102 --sta-parameters src/config/sta_skill_parameters.json --output outputs/carla/manual_assembly_new
+```
+
+网页和对话入口必须显式传入 `--sta-parameters`；省略时运行固定 STA 基线。
+评价支持八类任务、`--arm-order LL/LR/RL/RR`、装配顺序 `012/102/021`；
+`--viewer` 打开 MuJoCo 查看器。网页支持移动双臂场景，装配仍使用独立入口。
+参数按场景、对象、动作、任务组合、执行阶段、角度、时长、停靠范围匹配，
+超出已验证范围使用固定参数。运行记录保存实际参数库和执行器力矩。
+
+### 新训练、恢复与组合重新筛选
+
+```powershell
+python -X utf8 -B -u -m experiments.carla train --iterations 200 --combo-iterations 120 --seeds 7 19 43 --workers 3 --case-workers 3 --case-set study_v2 --output outputs/carla/study_v2
+# 仅在相同代码、预算、参数基线、工况标签和输出目录下恢复被中断的实验
+python -X utf8 -B -u -m experiments.carla train --iterations 200 --combo-iterations 120 --seeds 7 19 43 --workers 3 --case-workers 3 --case-set study_v2 --output outputs/carla/study_v2 --resume
+# 已有完整训练结果时，重新选择三类组合；生成候选库，不自动修改运行库
+python -X utf8 -B -u -m experiments.carla refine --previous outputs/carla/skills_suite_20261009 --case-set refinement_v2 --output outputs/carla/refinement_v2 --workers 3
+```
+
+15 个配置覆盖装配左臂六类技能（GRASP 分抓取/释放），以及移动平台左右臂的
+MOVE、ROTATE、GRASP 抓取/释放。`--profiles` 可指定子集，`--families` 指定组合。
+导航用固定位置伺服，不参加机械臂 STA 三参数学习。
+
+每技能配置从 5 个真实前序状态训练当前技能及后续 2 秒交接，再用 8 个完整任务
+选参、16 个独立留出任务验收。技能选择目标还包含 0.25 倍完整任务代价。
+组合候选每次执行完整任务，检查实际物体效果、释放、撤离、返回和切换表现。
+选参先冻结，再评估独立留出工况，成功配对用于计算改善率，失败数另行记录。
+
+`--case-set` 登记一套工况标签；默认采用输出目录名。独立新实验应使用新标签，
+不要把已用于诊断或选参的留出数据再次称为独立验证。断点保存 PDF、RNG、
+历史代价、代码指纹和候选日志；不匹配时拒绝恢复。源码整理前的旧实验不能
+直接 `--resume`。`--smoke` 仅进行 4 工况流程检查，其参数不能安装为运行库。
+
+CARLA 使用 401 点固定网格近似连续密度，以历史代价中位数计算奖励并更新
+高斯邻域；暖启动混合均匀探索和已验证参数邻域，是明确记录的工程变体，
+不等同于论文的自适应等概率网格。每个进程独占 MuJoCo 状态，
+`workers × case-workers` 是工况并发上限，内存较少时降低为 1。
+
+组合验收要求：全部留出任务成功、至少 8 个成功配对、平均综合代价降低 ≥2%、
+工况 bootstrap 95% 区间下界 >0、最差配对工况退化 ≤10%。代价包括跟踪误差、
+接触力、实际力矩、连续物理步力矩变化、实际目标误差和切换力矩跳变。
+移动场景还要求阀门角度误差 ≤5°；网页默认效果容差更宽，不能替代训练验收。
+工况置信区间不构成稳定性或全局最优证明。
+
+### 记录导出与参数安装
+
+```powershell
+python -X utf8 -B -m experiments.carla export outputs/carla/rejected_refinement_20261010 --output outputs/carla/export_copy
+python -X utf8 -B -u -m experiments.carla export outputs/carla/rejected_refinement_20261010 --output outputs/carla/export_copy --traces --trace-limit 1 --workers 3
+# 完整训练/重新筛选的 best_parameters.json 通过验收后，再显式安装
+python -X utf8 -B -m experiments.carla install outputs/carla/refinement_v2/best_parameters.json
+```
+
+`--output` 让导出文件与原实验分开，保留原记录和哈希。时序重跑须与原计分
+结果一致；旧物理配置的时序以已保存的原始记录为准。省略 `--trace-limit` 导出
+所有工况时序；100 Hz NPZ 保存期望/实际关节、实际执行器力矩和世界轴外力。
+完整任务控制指标按 500 Hz 物理步采样。安装前检查控制版本、验收证据和
+基准指纹，通过后写入指定参数文件，不再自动生成备份目录。
+网页服务需重新启动才能加载新参数。
+
+### 已完成结果与数据位置
+
+首次全技能实验 `outputs/carla/skills_suite_20261009` 已完成 15 配置、8 组合、
+3 种子，共 59400 次候选工况评价，2592 条留出 CSV、256 份完整任务 NPZ。
+单技能库首次 5 项通过，另外五类完整组合在各自 16 工况集通过验收：
+valve_L、valve_R、two_valves、inspect、rotate_inspect。
+
+`outputs/carla/rejected_refinement_20261010` 进一步修正三类执行/组合问题，
+从已有训练候选用每类 8 个完整任务选参，全部冻结后各用 32 个新工况验收。
+
+| 组合 | 基线/学习成功 | 平均综合代价降低 | 工况 bootstrap 95% 区间 |
+|---|---|---:|---|
+| 装配 | 32/32、32/32 | 20.17% | 18.69%–21.65% |
+| 连续旋拧 | 32/32、32/32 | 3.70% | 3.43%–3.96% |
+| 遮光协作 | 32/32、32/32 | 3.50% | 3.08%–3.93% |
+
+收益相对于修正后的固定参数基线，执行修复收益未计入 CARLA。全部配对工况
+均改善，但接触力 RMS 略升，不能理解为每项指标或运行时间均降低。
+
+装配仅把插销 A 闭合设置校准为 0.575，物块/插销 B 保持 0.6；重复旋拧按
+手轮当前角度对齐四辐夹取姿态；遮光右臂准备/持板保持基线，左臂旋拧与
+右臂收尾分别加载参数，阶段为 `assist_setup/main/assist_cleanup`。
+装配圆柱/凹槽没有螺纹机构，ROTATE 验证腕部轨迹并记录物体偏航；
+真实物体旋拧通过阀门角度验证。巡检当前验证观测位到达，尚无读数识别。
+
+后续三类修正记录含 192 条 CSV、6 份代表时序、源码/产物 manifest。
+另外五类运行 profiles 保持不变，当前八类组合分别在登记的 16 或 32 工况集中
+通过验收，部分技能仍用基线。数据还包括历史旋拧扩大实验
+`outputs/carla/rotation_expanded_20261009`。
+
+测试目录、迁移验证脚本、旧源码备份、诊断中间结果和控制台重复日志已清理。
+保留正式训练的候选日志、断点、选参、留出评价、CSV、图表和时序。
+代码路径改变后不要修改旧协议哈希冒充原版本。`outputs/` 被 Git 忽略，交付或移机需要单独
+备份实验数据；GitHub 上的代码和参数库足以运行，不包含完整训练原始记录。
+
+机械臂关节现在使用直接力矩输入、动力学偏置补偿和固定力矩变化率限制。
+运行记录区分控制指令和实际执行器力矩，旧网页记录保留原始输出含义。
+旧位置伺服结构下的 DDPG 权重不能作为当前力矩控制结构的已验证模型。
+
 前两项启动预设任务及原生查看器。长时序实验保持原来的默认流程：
 运行 STA 基线，训练 5 个 DDPG episode，再评估并绘制对比结果。
 运行该实验会产生训练数据和模型权重，不应将它作为普通导入检查。
@@ -181,7 +310,11 @@ npm.cmd run build
 接触技能导纳、独立 DDPG 装配实验、网页任务下发与监控。
 
 当前方案由 LLM 给出目标与阶段顺序，再由完整动作模板和次模优化生成执行计划，
-已放弃任务复杂度判别和 HTN。网页继续采用 Vue + FastAPI，CARLA 暂缓。
+已放弃任务复杂度判别和 HTN。网页继续采用 Vue + FastAPI，CARLA 已接入
+左右臂技能的离线三参数训练、完整组合验收及按场景/任务/阶段加载参数。
+15 个技能配置已完成训练，其中 5 个通过单独技能库验收；组合选参覆盖 8 类任务，
+完成上述失败修正后均在各自的独立工况集通过验收。部分技能在组合中仍使用固定基准，
+不能将组合改善等同于每个单独技能均已改善。
 网页已实现控制曲线、记录对比、持久化和状态回放；后续研究包括
 DDPG 补偿与主流程集成，以及更完整的实验评估。
 目前辅助动作支持 R 臂遮光；压力表支持观测位到达，尚未实现读数识别。

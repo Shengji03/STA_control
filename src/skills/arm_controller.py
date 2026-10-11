@@ -5,6 +5,7 @@ import numpy as np
 
 from src.config.robot import DOF, INITIAL_JOINTS
 from src.controller.sta_controller import STAController
+from src.controller.arm_torque import compute_arm_torque
 from src.robot import UR5e
 
 from .base_skill import DEFAULT_STA_PARAMS
@@ -34,6 +35,10 @@ class ArmController:
         ]
         self.executor = None
         self.ctx = SkillContext(model, data, self.robot, dof, sensor_offset=sensor_offset)
+        self.model, self.data = model, data
+        self._actuator_ids = np.array([mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR,
+            name + ('_R' if label == 'R' else '')) for name in
+            ('shoulder_pan', 'shoulder_lift', 'elbow', 'wrist_1', 'wrist_2', 'wrist_3')])
         self.gripper_target = 0.0
         self._prev_desired = self.initial_q.copy()
 
@@ -45,12 +50,8 @@ class ArmController:
 
     def compute_control(self, desired_pos, sensor_data, real_vel, ts, desired_velocity=None):
         desired_pos = np.asarray(desired_pos)
-        error_pos = desired_pos - sensor_data
         desired_vel = ((desired_pos - self._prev_desired) / ts if desired_velocity is None
                        else np.asarray(desired_velocity))
         self._prev_desired = desired_pos.copy()
-        error_vel = desired_vel - real_vel
-        return np.array([
-            controller.control(error_pos[i], error_vel[i])
-            for i, controller in enumerate(self.sta_controllers)
-        ])
+        return compute_arm_torque(self.model, self.data, self.sta_controllers,
+                                  self._actuator_ids, desired_pos, desired_vel, sensor_data, real_vel)

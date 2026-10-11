@@ -5,6 +5,7 @@ TaskRunner: Unified main loop connecting perception, LLM planning, and control e
 import numpy as np
 import mujoco
 import mujoco.viewer
+from copy import deepcopy
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 from ..perception.perception_module import PerceptionModule
 from ..controller.sta_controller.sta_controller import STAController
+from ..controller.arm_torque import compute_arm_torque
 from ..skills.skill_executor import SkillExecutor, SkillContext
 from ..skills.skills import MoveSkill
 from ..skills.base_skill import SkillType, SKILL_STA_PARAMS
@@ -39,16 +41,20 @@ class TaskRunner:
         scene_path: str,
         llm_planner: Optional["DialogPlanner"] = None,
         task_instruction: str = "",
-        plan_dict: Optional[dict] = None
+        plan_dict: Optional[dict] = None,
+        render_perception: bool = True,
+        sta_parameters=None,
+        model=None,
     ):
         # Load MuJoCo model
-        self.model = mujoco.MjModel.from_xml_path(scene_path)
+        self.model = model if model is not None else mujoco.MjModel.from_xml_path(scene_path)
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
 
         # Perception
         self.perception = PerceptionModule(
             self.model, self.data,
+            enable_rendering=render_perception,
             scene_path=scene_path,
             camera_names=['cam_global'],
             tracked_bodies=['shade_board', 'valve_body_1', 'valve_body_2',
@@ -69,6 +75,7 @@ class TaskRunner:
         self.llm_planner = llm_planner
         self.task_instruction = task_instruction
         self.plan_dict = plan_dict
+        self.sta_parameters = sta_parameters
 
         # 如果是 DialogPlanner, 注入 MuJoCo 环境以激活 FeedbackManager
         if hasattr(llm_planner, 'attach_env'):
@@ -199,6 +206,16 @@ class TaskRunner:
 
         self._phases = parsed.get('phases', [])
         self._phase_index = 0
+        goals = self.prepared_plan.get('goals', [])
+        if len(goals) > 1:
+            self.workflow_tag = ('rotate_inspect' if any(g.get('operation')=='inspect' for g in goals)
+                                 else 'repeat' if len({g['object'] for g in goals}) == 1 else 'two_valves')
+        elif any(g.get('shade') == 'required' for g in goals):
+            self.workflow_tag = 'shade'
+        elif goals and goals[0].get('operation') == 'inspect':
+            self.workflow_tag = 'inspect'
+        else:
+            self.workflow_tag = 'valve_R' if self._phases and self._phases[0].get('mode') == 'single_R' else 'valve_L'
 
         for i, phase in enumerate(self._phases):
             nav = phase.get('nav')
@@ -232,10 +249,24 @@ class TaskRunner:
         )
 
     def _setup_arm_executor(self, label: str, skills: list, phase_index: int,
-                            append_return: bool = True):
+                            append_return: bool = True, execution_stage: str = 'main'):
         """Initialize executor for one arm with given skills."""
         arm = self.arms[label]
-        skills = list(skills)
+        skills = deepcopy(list(skills))
+        # Repeated valve work must grip the current handwheel orientation.
+        # These cross-spoke wheels have fourfold rotational symmetry. Updating
+        # wrist 3 rotates the down-facing jaws without changing the pinch point.
+        for skill in skills:
+            target_object = getattr(skill, 'target_object', None)
+            spec = self.perception.registry.objects.get(target_object)
+            if (spec and spec.kind == 'valve' and spec.joint
+                    and getattr(skill, 'target_joints', None) is not None):
+                joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, spec.joint)
+                if joint_id < 0:
+                    raise ValueError(f'Missing valve joint for grasp alignment: {spec.joint}')
+                angle = float(self.data.qpos[self.model.jnt_qposadr[joint_id]])
+                yaw_offset = (angle + np.pi / 4) % (np.pi / 2) - np.pi / 4
+                skill.target_joints[-1] -= yaw_offset
         if append_return:
             skills.append(self._make_return_skill())
         n = len(skills)
@@ -245,6 +276,15 @@ class TaskRunner:
         arm.ctx = SkillContext(
             self.model, self.data, arm.robot, DOF, arm.sensor_offset
         )
+        arm.ctx.parameter_bank = self.sta_parameters
+        arm.ctx.execution_stage = execution_stage
+        from pathlib import Path
+        arm.ctx.scene_name = Path(self.perception.scene_path).name
+        arm.ctx.workflow_tag = self.workflow_tag
+        goals=self.prepared_plan.get('goals', [])
+        arm.ctx.workflow_goal_count=len(goals)
+        arm.ctx.workflow_goal_objects=[g['object'] for g in goals]
+        arm.ctx.workflow_goal_angles=[g['angle'] for g in goals if g.get('operation')=='rotate']
         flange_name = 'flange' if label == 'L' else 'flange_R'
         arm.ctx.flange_body_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_BODY, flange_name)
@@ -270,7 +310,7 @@ class TaskRunner:
                 r_skills = list(phase['R'])
                 self._R_cleanup_skills = phase['R_cleanup']
                 self._setup_arm_executor('R', r_skills, phase_index,
-                                         append_return=False)
+                                         append_return=False, execution_stage='assist_setup')
                 self._pending_L_skills = phase['L']
                 self._L_waiting_for_R = True
                 self._R_cleanup_pending = True
@@ -336,21 +376,11 @@ class TaskRunner:
     def _compute_arm_control(self, arm: ArmState, desired: np.ndarray,
                              desired_velocity: np.ndarray = None) -> np.ndarray:
         """Compute STA control for one arm."""
-        sensor = self._get_arm_sensor(arm)
-        ts = self.model.opt.timestep
-        vel = (sensor - arm.prev_sensor) / ts
-        arm.prev_sensor = sensor.copy()
-
-        error_pos = desired - sensor
         if desired_velocity is None:
             desired_velocity = np.zeros(DOF)
-        error_vel = desired_velocity - vel
-
-        ctrl = np.zeros(DOF)
-        for i in range(DOF):
-            ctrl[i] = arm.sta_controllers[i].control(error_pos[i], error_vel[i])
-
-        return ctrl
+        start = self._L_ctrl_start if arm.label == 'L' else self._R_ctrl_start
+        return compute_arm_torque(self.model, self.data, arm.sta_controllers,
+                                  np.arange(start, start + DOF), desired, desired_velocity)
 
     def _update_state(self, t: float):
         """State machine update with multi-phase support."""
@@ -406,7 +436,7 @@ class TaskRunner:
                 self.arm_R.prev_sensor = sensor.copy()
                 cleanup_skills = self._R_cleanup_skills
                 self._setup_arm_executor('R', cleanup_skills,
-                                         self._phase_index)
+                                         self._phase_index, execution_stage='assist_cleanup')
                 self.arm_R.ctx.gripper_target = prev_gripper
                 self._R_cleanup_pending = False
                 self._R_cleanup_skills = None
@@ -604,6 +634,8 @@ class TaskRunner:
             self.data.ctrl[gripper_ctrl] = gripper_target
 
     def _record_tcp_history(self):
+        if not self._show_trajectory:
+            return
         self._traj_step_count += 1
         if self._traj_step_count % 10 != 0:
             return

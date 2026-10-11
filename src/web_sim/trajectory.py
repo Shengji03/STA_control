@@ -130,7 +130,9 @@ def telemetry_sample(runner, scratch):
                              'actual_tcp': actual.round(6).tolist(), 'reference_tcp': target.round(6).tolist(),
                              'tcp_error_m': float(np.linalg.norm(target - actual)),
                              'force': wrench[:3].round(5).tolist(), 'moment': wrench[3:].round(5).tolist(),
-                             'torque': np.asarray(reference.get('torque', np.zeros(6))).round(5).tolist(),
+                             'torque': runner.data.actuator_force[(runner._L_ctrl_start if label == 'L' else runner._R_ctrl_start):
+                                                                  (runner._L_ctrl_start if label == 'L' else runner._R_ctrl_start) + 6].round(5).tolist(),
+                             'commanded_torque': np.asarray(reference.get('torque', np.zeros(6))).round(5).tolist(),
                              'skill': skill.name if skill else ('保持' if label == 'R' and runner._R_cleanup_pending else '待命'),
                              'skill_index': executor.current_index if executor else -1,
                              'skill_count': len(executor.skills) if executor else 0}

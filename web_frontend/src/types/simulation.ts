@@ -138,6 +138,8 @@ export interface ExecutionPhase {
   cleanup_R: PlanStep[];
 }
 export interface TaskDetail {
+  control_version?: string;
+  torque_source?: string;
   task?: TaskRecord;
   task_id?: string;
   scene?: string;

@@ -1,4 +1,5 @@
 import numpy as np
+from math import sqrt
 
 from ..controller import Controller
 
@@ -30,21 +31,24 @@ class STAController(Controller):
         self.__u2 = 0.0
 
     def control(self, error_pos: float, error_vel: float) -> float:
-        s = error_vel + self.__lambda_s * error_pos
+        s = float(error_vel) + self.__lambda_s * float(error_pos)
 
         # 死区: 误差极小时停止施加控制, 让积分项自然衰减
-        if np.abs(s) < self.__dead_zone:
+        if abs(s) < self.__dead_zone:
             self.__u2 *= (1.0 - self.__u2_leak * self.__ts)
             return self.__u2
 
-        sat = s / (np.abs(s) + self.__delta)   # 连续近似 sign(s)
+        sat = s / (abs(s) + self.__delta)   # 连续近似 sign(s)
 
-        u1 = self.__alpha * np.sqrt(np.abs(s)) * sat
+        u1 = self.__alpha * sqrt(abs(s)) * sat
 
         self.__u2 += self.__beta * sat * self.__ts
         # 泄漏积分: 持续将 u2 向 0 衰减, 防止静态时残余力矩振荡
         self.__u2 *= (1.0 - self.__u2_leak * self.__ts)
-        self.__u2 = np.clip(self.__u2, -self.__u2_max, self.__u2_max)
+        if self.__u2 > self.__u2_max:
+            self.__u2 = self.__u2_max
+        elif self.__u2 < -self.__u2_max:
+            self.__u2 = -self.__u2_max
 
         return u1 + self.__u2
 
@@ -52,9 +56,22 @@ class STAController(Controller):
         self.__u2 = 0.0
 
     def set_parameter(self, alpha: float, beta: float, lambda_s: float):
-        self.__alpha = alpha
-        self.__beta = beta
-        self.__lambda_s = lambda_s
+        if not all(np.isfinite(x) and x > 0 for x in (alpha, beta, lambda_s)):
+            raise ValueError('STA parameters must be positive and finite')
+        self.__alpha = float(alpha)
+        self.__beta = float(beta)
+        self.__lambda_s = float(lambda_s)
+
+    def get_state(self):
+        return {'integral': float(self.__u2), 'alpha': self.__alpha,
+                'beta': self.__beta, 'lambda_s': self.__lambda_s}
+
+    def set_state(self, state):
+        self.set_parameter(state['alpha'], state['beta'], state['lambda_s'])
+        value = float(state['integral'])
+        if not np.isfinite(value):
+            raise ValueError('Non-finite STA integral state')
+        self.__u2 = float(np.clip(value, -self.__u2_max, self.__u2_max))
 
     @property
     def alpha(self):
